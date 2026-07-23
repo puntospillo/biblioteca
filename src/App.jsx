@@ -221,6 +221,35 @@ const StatCard = ({ label, value, icon: Icon, color }) => {
     </Card>
   );
 };
+class ErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+  static getDerivedStateFromError(error) {
+    return { hasError: true, error };
+  }
+  componentDidCatch(error, errorInfo) {
+    console.error("ErrorBoundary caught an error:", error, errorInfo);
+  }
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="p-8 text-center bg-red-50 rounded-2xl border border-red-200 max-w-md mx-auto my-12">
+          <h3 className="text-lg font-black text-red-700 mb-2">Si è verificato un problema con questi dati</h3>
+          <p className="text-xs text-red-600 mb-4">{this.state.error?.message || 'Si è verificato un errore nei dati del libro.'}</p>
+          <button 
+            onClick={() => { this.setState({ hasError: false }); window.location.reload(); }} 
+            className="px-4 py-2 bg-red-600 hover:bg-red-700 text-white font-bold text-xs rounded-xl cursor-pointer shadow"
+          >
+            Ricarica Applicazione
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 export default function App() {
   const [user, setUser] = useState(null);
@@ -255,7 +284,7 @@ export default function App() {
         firstName: 'Primo',
         lastName: 'Levi',
         coverUrl: '',
-        status: 'READ',
+        status: 'READING',
         rating: 5,
         isNextRead: false,
         description: 'Testimonianza drammatica e lucidissima dell\'esperienza dell\'autore nel campo di concentramento di Auschwitz.',
@@ -291,7 +320,9 @@ export default function App() {
   useEffect(() => {
     try {
       localStorage.setItem('myBooksData_cloud_cache', JSON.stringify(books));
-    } catch (e) {}
+    } catch (e) {
+      console.warn("Impossibile salvare cache in localStorage:", e);
+    }
   }, [books]);
 
   const showToast = (message, type = 'success') => {
@@ -317,23 +348,25 @@ export default function App() {
   };
 
   const openBookDetails = (book) => {
+    if (!book) return;
     setSelectedBook(book);
     setActiveTab('scheda_libro');
   };
 
   const saveBookToCloud = async (bookData) => {
+    if (!bookData) return;
     const bookId = bookData.id || generateUniqueId();
     const cleanBook = {
       id: bookId,
-      title: bookData.title || 'Senza Titolo',
-      firstName: bookData.firstName || '',
-      lastName: bookData.lastName || 'Sconosciuto',
-      coverUrl: bookData.coverUrl || '',
+      title: (bookData.title || 'Senza Titolo').trim(),
+      firstName: (bookData.firstName || '').trim(),
+      lastName: (bookData.lastName || 'Sconosciuto').trim(),
+      coverUrl: (bookData.coverUrl || '').trim(),
       status: bookData.status || 'TO_READ',
       rating: Number(bookData.rating) || 0,
       isNextRead: !!bookData.isNextRead,
-      description: bookData.description || '',
-      notes: bookData.notes || '',
+      description: (bookData.description || '').trim(),
+      notes: (bookData.notes || '').trim(),
       updatedAt: new Date().toISOString(),
       userId: user ? user.uid : 'local-user'
     };
@@ -350,6 +383,7 @@ export default function App() {
   };
 
   const deleteBookFromCloud = async (bookId) => {
+    if (!bookId) return;
     setBooks(prev => prev.filter(b => b.id !== bookId));
     showToast("Libro eliminato dalla libreria!");
   };
@@ -1136,10 +1170,35 @@ export default function App() {
 
   // 6. Scheda Libro (Book Details & Editing View - Complete Repair)
   const SchedaLibro = () => {
-    const [form, setForm] = useState(selectedBook || {
-      title: '', firstName: '', lastName: '', coverUrl: '',
-      status: 'TO_READ', rating: 0, isNextRead: false, description: '', notes: ''
-    });
+    const [form, setForm] = useState(() => ({
+      id: selectedBook?.id || '',
+      title: selectedBook?.title || '',
+      firstName: selectedBook?.firstName || '',
+      lastName: selectedBook?.lastName || '',
+      coverUrl: selectedBook?.coverUrl || '',
+      status: selectedBook?.status || 'TO_READ',
+      rating: Number(selectedBook?.rating) || 0,
+      isNextRead: !!selectedBook?.isNextRead,
+      description: selectedBook?.description || '',
+      notes: selectedBook?.notes || ''
+    }));
+
+    useEffect(() => {
+      if (selectedBook) {
+        setForm({
+          id: selectedBook.id || '',
+          title: selectedBook.title || '',
+          firstName: selectedBook.firstName || '',
+          lastName: selectedBook.lastName || '',
+          coverUrl: selectedBook.coverUrl || '',
+          status: selectedBook.status || 'TO_READ',
+          rating: Number(selectedBook.rating) || 0,
+          isNextRead: !!selectedBook.isNextRead,
+          description: selectedBook.description || '',
+          notes: selectedBook.notes || ''
+        });
+      }
+    }, [selectedBook]);
 
     const updateField = (field, value) => setForm(prev => ({ ...prev, [field]: value }));
 
@@ -1563,21 +1622,23 @@ export default function App() {
         </nav>
       </header>
 
-      {/* Main View Container */}
+      {/* Main View Container con ErrorBoundary per prevenire schermata bianca */}
       <main className="flex-1 max-w-7xl w-full mx-auto p-4 sm:p-6">
-        {activeTab === 'dashboard' && <DashboardView />}
-        {activeTab === 'libreria' && <LibreriaView />}
-        {activeTab === 'esplora_bestseller' && (
-          <EsploraOnlineView mode="bestseller" results={bestsellerResults} setResults={setBestsellerResults} />
-        )}
-        {activeTab === 'esplora_novita' && (
-          <EsploraOnlineView mode="novita" results={novitaResults} setResults={setNovitaResults} />
-        )}
-        {activeTab === 'cerca_online' && (
-          <CercaOnlineView data={cercaResults} setData={setCercaResults} />
-        )}
-        {activeTab === 'import_export' && <ImportBackupView />}
-        {activeTab === 'scheda_libro' && <SchedaLibro />}
+        <ErrorBoundary>
+          {activeTab === 'dashboard' && <DashboardView />}
+          {activeTab === 'libreria' && <LibreriaView />}
+          {activeTab === 'esplora_bestseller' && (
+            <EsploraOnlineView mode="bestseller" results={bestsellerResults} setResults={setBestsellerResults} />
+          )}
+          {activeTab === 'esplora_novita' && (
+            <EsploraOnlineView mode="novita" results={novitaResults} setResults={setNovitaResults} />
+          )}
+          {activeTab === 'cerca_online' && (
+            <CercaOnlineView data={cercaResults} setData={setCercaResults} />
+          )}
+          {activeTab === 'import_export' && <ImportBackupView />}
+          {activeTab === 'scheda_libro' && <SchedaLibro key={selectedBook ? selectedBook.id : 'nuovo-libro'} />}
+        </ErrorBoundary>
       </main>
 
       {/* Footer */}
