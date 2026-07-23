@@ -3,7 +3,8 @@ import {
   BookOpen, CheckCircle, Circle, Star, Wand2, Sparkles, 
   Book, Bookmark, Search, Layers, Trash2, Plus, Image as ImageIcon, 
   RefreshCw, Download, Upload, FileSpreadsheet, Loader2, Settings, 
-  Key, X, ArrowLeft, Library, SlidersHorizontal, Share2, Copy
+  Key, X, ArrowLeft, Library, SlidersHorizontal, Share2, Copy,
+  ChevronUp, ChevronDown, UploadCloud, Move
 } from 'lucide-react';
 
 const appId = typeof window !== 'undefined' && window.__app_id ? window.__app_id : 'libri-di-maurizio';
@@ -19,23 +20,65 @@ const STATUSES = {
 const auth = typeof window !== 'undefined' && window.auth ? window.auth : null;
 const db = typeof window !== 'undefined' && window.db ? window.db : null;
 
-// Gemini API Helper with key fallback and retry logic
+// Gemini API: rileva automaticamente i modelli disponibili e li testa con chiamate reali
+let verifiedModel = null;
+
 const callGeminiAPI = async (prompt, systemInstruction = "", useSearch = false, expectJson = false) => {
-  const savedKey = localStorage.getItem('gemini_api_key') || (import.meta.env ? import.meta.env.VITE_GEMINI_API_KEY : "") || "";
+  const savedKey = (localStorage.getItem('gemini_api_key') || (import.meta.env ? import.meta.env.VITE_GEMINI_API_KEY : "") || "").trim();
   if (!savedKey) {
     throw new Error("CHIAVE_API_MANCANTE");
   }
 
-  const models = [
-    'gemini-2.5-flash-preview-09-2025',
-    'gemini-1.5-flash',
-    'gemini-2.0-flash'
-  ];
+  // Se abbiamo già un modello verificato, usalo direttamente
+  const modelsToTry = [];
+  if (verifiedModel) {
+    modelsToTry.push(verifiedModel);
+  } else {
+    // Scopri i modelli disponibili sulla chiave API
+    try {
+      const listRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${savedKey}`);
+      if (listRes.ok) {
+        const listData = await listRes.json();
+        const available = (listData.models || [])
+          .filter(m => m.supportedGenerationMethods?.includes('generateContent'))
+          .map(m => m.name.replace('models/', ''));
+        
+        const preferred = [
+          'gemini-2.0-flash',
+          'gemini-2.0-flash-lite', 
+          'gemini-2.5-flash-preview-05-20',
+          'gemini-2.5-flash',
+          'gemini-1.5-flash',
+          'gemini-1.5-pro'
+        ];
+        
+        for (const pref of preferred) {
+          if (available.includes(pref)) modelsToTry.push(pref);
+        }
+        for (const m of available) {
+          if (!modelsToTry.includes(m)) modelsToTry.push(m);
+        }
+      } else {
+        const errJson = await listRes.json().catch(() => ({}));
+        const msg = errJson.error?.message || '';
+        if (msg.includes('API key not valid') || msg.includes('API_KEY_INVALID')) {
+          throw new Error("Chiave API non valida. Generane una nuova da aistudio.google.com/app/apikey");
+        }
+      }
+    } catch (e) {
+      if (e.message.includes('Chiave API')) throw e;
+    }
+    
+    if (modelsToTry.length === 0) {
+      modelsToTry.push('gemini-2.0-flash', 'gemini-2.0-flash-lite');
+    }
+  }
 
-  let lastError = null;
+  let lastErrorMsg = '';
 
-  for (const model of models) {
+  for (const model of modelsToTry) {
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${savedKey}`;
+    
     const payload = {
       contents: [{ parts: [{ text: prompt }] }],
       systemInstruction: { 
@@ -43,28 +86,53 @@ const callGeminiAPI = async (prompt, systemInstruction = "", useSearch = false, 
       }
     };
     
-    if (useSearch) payload.tools = [{ "google_search": {} }];
+    if (useSearch) payload.tools = [{ "googleSearch": {} }];
     if (expectJson) payload.generationConfig = { responseMimeType: "application/json" };
 
     try {
-      const res = await fetch(url, {
+      let res = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
       });
-      if (!res.ok) {
-        const errJson = await res.json().catch(() => ({}));
-        throw new Error(errJson.error?.message || `HTTP ${res.status}`);
+
+      if (!res.ok && useSearch) {
+        const payloadNoSearch = { ...payload };
+        delete payloadNoSearch.tools;
+        const retryRes = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payloadNoSearch)
+        });
+        if (retryRes.ok) res = retryRes;
       }
-      const data = await res.json();
-      const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
-      if (text) return text;
+
+      if (res.ok) {
+        const data = await res.json();
+        const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (text) {
+          verifiedModel = model;
+          return text;
+        }
+      }
+
+      const errJson = await res.json().catch(() => ({}));
+      const rawMsg = errJson.error?.message || `HTTP ${res.status}`;
+      
+      if (rawMsg.includes('API key not valid') || rawMsg.includes('API_KEY_INVALID')) {
+        throw new Error("Chiave API non valida. Generane una nuova da aistudio.google.com/app/apikey");
+      }
+
+      lastErrorMsg = rawMsg;
+      continue;
     } catch (e) {
-      lastError = e;
+      if (e.message.includes('Chiave API')) throw e;
+      lastErrorMsg = e.message;
     }
   }
 
-  throw lastError || new Error("Impossibile completare la richiesta AI.");
+  verifiedModel = null;
+  throw new Error(`Errore Gemini: ${lastErrorMsg}`);
 };
 
 // Triple-Engine Cover Fetching (Apple Books -> Google Books -> OpenLibrary)
@@ -286,6 +354,20 @@ export default function App() {
     showToast("Libro eliminato dalla libreria!");
   };
 
+  const moveBook = (id, direction) => {
+    setBooks(prev => {
+      const index = prev.findIndex(b => b.id === id);
+      if (index === -1) return prev;
+      const targetIndex = direction === 'up' ? index - 1 : index + 1;
+      if (targetIndex < 0 || targetIndex >= prev.length) return prev;
+      const newBooks = [...prev];
+      const temp = newBooks[index];
+      newBooks[index] = newBooks[targetIndex];
+      newBooks[targetIndex] = temp;
+      return newBooks;
+    });
+  };
+
   const handleAiCallWithCheck = async (prompt, systemInstruction = "", useSearch = false, expectJson = false) => {
     try {
       return await callGeminiAPI(prompt, systemInstruction, useSearch, expectJson);
@@ -310,6 +392,7 @@ export default function App() {
       ? (ratedReadBooks.reduce((sum, b) => sum + Number(b.rating), 0) / ratedReadBooks.length).toFixed(1) 
       : '0.0';
 
+    const readingBooks = books.filter(b => b.status === 'READING');
     const preferiti = books.filter(b => b.rating >= 4).slice(0, 15);
     const giaLetti = readBooks.slice(0, 15);
     const inProssimaLettura = books.filter(b => b.isNextRead).slice(0, 15);
@@ -346,6 +429,38 @@ export default function App() {
           <StatCard label="Da Leggere" value={toReadCount} icon={Circle} color="amber" />
           <StatCard label="Media Voti (Letti)" value={`${avgRating} ★`} icon={Star} color="purple" />
         </div>
+
+        {/* Banner Speciale Libri In Lettura */}
+        {readingBooks.length > 0 && (
+          <div className="bg-gradient-to-r from-blue-600 via-indigo-600 to-blue-700 rounded-2xl p-5 text-white shadow-lg relative overflow-hidden">
+            <div className="flex items-center justify-between mb-4 border-b border-blue-400/30 pb-3">
+              <div className="flex items-center gap-2">
+                <span className="flex h-3 w-3 relative">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-sky-400 opacity-75"></span>
+                  <span className="relative inline-flex rounded-full h-3 w-3 bg-sky-300"></span>
+                </span>
+                <h3 className="font-extrabold text-base tracking-wide flex items-center gap-2">
+                  📖 ATTUALMENTE IN LETTURA ({readingBooks.length})
+                </h3>
+              </div>
+              <button onClick={() => navigateTo('libreria')} className="text-xs bg-white/20 hover:bg-white/30 px-3 py-1 rounded-lg font-bold backdrop-blur-sm transition-all cursor-pointer">
+                Vedi Tutti in Libreria →
+              </button>
+            </div>
+            <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-3">
+              {readingBooks.map(b => (
+                <div key={b.id} onClick={() => openBookDetails(b)} className="bg-white/10 hover:bg-white/20 p-2.5 rounded-xl backdrop-blur-md transition-all cursor-pointer border border-white/20 hover:scale-[1.03] group">
+                  <div className="h-32 w-full bg-slate-800/40 rounded-lg overflow-hidden relative mb-2 shadow">
+                    {b.coverUrl ? <img src={b.coverUrl} className="w-full h-full object-cover" alt="Cover" /> : <Book className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 text-white/50" size={24} />}
+                    <span className="absolute top-1.5 right-1.5 bg-blue-500 text-white text-[9px] font-black px-1.5 py-0.5 rounded shadow">IN LETTURA</span>
+                  </div>
+                  <p className="text-xs font-bold text-white truncate group-hover:underline">{b.title}</p>
+                  <p className="text-[10px] text-blue-200 truncate">{b.lastName} {b.firstName}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
 
         <div className="flex flex-col sm:flex-row gap-4">
           <button onClick={handleConsiglioBibliotecario} className="flex-1 bg-gradient-to-r from-purple-600 to-indigo-600 text-white px-6 py-4 rounded-xl font-bold shadow-md hover:shadow-lg transition-all flex items-center justify-center text-xs cursor-pointer">
@@ -527,26 +642,67 @@ export default function App() {
         </div>
 
         <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-4 mt-4">
-          {filtered.map(b => (
-            <div key={b.id} className={`bg-white rounded-2xl shadow-sm border flex flex-col relative h-[340px] transition-all hover:shadow-md ${selectedIds.includes(b.id) ? 'border-blue-500 ring-2 ring-blue-100' : 'border-slate-200'}`}>
-              <div className="absolute top-2 left-2 z-10">
-                <input type="checkbox" checked={selectedIds.includes(b.id)} onChange={() => toggleSelect(b.id)} className="w-5 h-5 cursor-pointer accent-blue-600"/>
-              </div>
-              <div className="h-48 w-full bg-slate-50 flex-shrink-0 cursor-pointer overflow-hidden border-b border-slate-100 relative rounded-t-2xl" onClick={() => openBookDetails(b)}>
-                {b.coverUrl ? <img src={b.coverUrl} className="w-full h-full object-cover" alt="Cover" /> : <Book className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 text-slate-300" size={32}/>}
-              </div>
-              <div className="p-3 flex flex-col flex-grow">
-                <h3 className="font-bold text-slate-800 text-xs line-clamp-2 leading-tight">{b.title}</h3>
-                <p className="text-[11px] text-slate-500 line-clamp-1 mt-1 font-medium">{b.lastName} {b.firstName}</p>
-                <div className="mt-1 flex text-yellow-400">
-                   {[...Array(5)].map((_,i) => <Star key={i} size={11} className={i < (b.rating || 0) ? 'fill-yellow-400 text-yellow-400' : 'text-slate-200'} />)}
+          {filtered.map((b, idx) => {
+            const isReading = b.status === 'READING';
+            return (
+              <div 
+                key={b.id} 
+                className={`bg-white rounded-2xl shadow-sm border flex flex-col relative h-[350px] transition-all group ${
+                  isReading 
+                    ? 'border-2 border-blue-500 ring-4 ring-blue-100/80 bg-blue-50/20 shadow-md shadow-blue-500/10' 
+                    : selectedIds.includes(b.id) 
+                      ? 'border-blue-500 ring-2 ring-blue-100' 
+                      : 'border-slate-200 hover:border-slate-300 hover:shadow-md'
+                }`}
+              >
+                {/* Seleziona Checkbox */}
+                <div className="absolute top-2 left-2 z-10">
+                  <input type="checkbox" checked={selectedIds.includes(b.id)} onChange={() => toggleSelect(b.id)} className="w-5 h-5 cursor-pointer accent-blue-600 shadow"/>
                 </div>
-                <div className="mt-auto pt-2 flex justify-between items-center">
-                  <span className={`text-[9px] font-bold px-2 py-0.5 rounded-md uppercase border ${STATUSES[b.status]?.color || 'bg-slate-100'}`}>{STATUSES[b.status]?.label}</span>
+
+                {/* Pulsanti Spostamento Su / Giù nell'ordine */}
+                <div className="absolute top-2 right-2 z-10 flex flex-col gap-1 opacity-90 group-hover:opacity-100 transition-opacity bg-white/90 backdrop-blur-sm p-0.5 rounded-lg shadow-sm border border-slate-200">
+                  <button 
+                    title="Sposta Su nella lista" 
+                    onClick={(e) => { e.stopPropagation(); moveBook(b.id, 'up'); }}
+                    disabled={idx === 0}
+                    className="p-1 hover:bg-blue-100 text-slate-700 hover:text-blue-700 disabled:opacity-30 rounded transition-colors cursor-pointer"
+                  >
+                    <ChevronUp size={14} />
+                  </button>
+                  <button 
+                    title="Sposta Giù nella lista" 
+                    onClick={(e) => { e.stopPropagation(); moveBook(b.id, 'down'); }}
+                    disabled={idx === filtered.length - 1}
+                    className="p-1 hover:bg-blue-100 text-slate-700 hover:text-blue-700 disabled:opacity-30 rounded transition-colors cursor-pointer"
+                  >
+                    <ChevronDown size={14} />
+                  </button>
+                </div>
+
+                {/* Badge In Lettura Prominente */}
+                {isReading && (
+                  <div className="absolute top-2 left-9 z-10 bg-gradient-to-r from-blue-600 to-indigo-600 text-white text-[9px] font-black uppercase px-2 py-0.5 rounded-full shadow flex items-center gap-1 animate-pulse">
+                    <span>📖 IN LETTURA</span>
+                  </div>
+                )}
+
+                <div className="h-48 w-full bg-slate-50 flex-shrink-0 cursor-pointer overflow-hidden border-b border-slate-100 relative rounded-t-2xl" onClick={() => openBookDetails(b)}>
+                  {b.coverUrl ? <img src={b.coverUrl} className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300" alt="Cover" /> : <Book className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 text-slate-300" size={32}/>}
+                </div>
+                <div className="p-3 flex flex-col flex-grow">
+                  <h3 className="font-bold text-slate-800 text-xs line-clamp-2 leading-tight">{b.title}</h3>
+                  <p className="text-[11px] text-slate-500 line-clamp-1 mt-1 font-medium">{b.lastName} {b.firstName}</p>
+                  <div className="mt-1 flex text-yellow-400">
+                     {[...Array(5)].map((_,i) => <Star key={i} size={11} className={i < (b.rating || 0) ? 'fill-yellow-400 text-yellow-400' : 'text-slate-200'} />)}
+                  </div>
+                  <div className="mt-auto pt-2 flex justify-between items-center">
+                    <span className={`text-[9px] font-bold px-2 py-0.5 rounded-md uppercase border ${STATUSES[b.status]?.color || 'bg-slate-100'}`}>{STATUSES[b.status]?.label}</span>
+                  </div>
                 </div>
               </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       </div>
     );
@@ -923,23 +1079,100 @@ export default function App() {
       navigateTo('libreria');
     };
 
+    const [isDraggingCover, setIsDraggingCover] = useState(false);
+
+    const handleCoverDrop = (e) => {
+      e.preventDefault();
+      setIsDraggingCover(false);
+      
+      if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+        const file = e.dataTransfer.files[0];
+        if (file.type.startsWith('image/')) {
+          const reader = new FileReader();
+          reader.onload = (event) => {
+            updateField('coverUrl', event.target.result);
+            showToast("Copertina salvata dall'immagine trascinata!");
+          };
+          reader.readAsDataURL(file);
+          return;
+        }
+      }
+
+      const droppedUrl = e.dataTransfer.getData('text/uri-list') || e.dataTransfer.getData('URL') || e.dataTransfer.getData('text/plain');
+      if (droppedUrl && (droppedUrl.startsWith('http://') || droppedUrl.startsWith('https://') || droppedUrl.startsWith('data:image/'))) {
+        updateField('coverUrl', droppedUrl.trim());
+        showToast("Copertina aggiornata dall'URL trascinato!");
+      } else {
+        showToast("Trascina un file immagine o un'immagine dal browser.", "info");
+      }
+    };
+
+    const handleCoverFileInput = (e) => {
+      if (e.target.files && e.target.files[0]) {
+        const file = e.target.files[0];
+        const reader = new FileReader();
+        reader.onload = (event) => {
+          updateField('coverUrl', event.target.result);
+          showToast("Copertina caricata con successo!");
+        };
+        reader.readAsDataURL(file);
+      }
+    };
+
     return (
       <div className="max-w-5xl mx-auto bg-white rounded-2xl shadow-md border border-slate-200 overflow-hidden flex flex-col md:flex-row">
-        {/* Colonna Sinistra: Copertina */}
+        {/* Colonna Sinistra: Copertina con Drag & Drop */}
         <div className="w-full md:w-1/3 bg-slate-50 p-6 flex flex-col items-center border-r border-slate-200">
-          <div className="w-full max-w-[220px] aspect-[2/3] bg-slate-200 rounded-xl shadow border border-slate-300 overflow-hidden relative mb-4 flex items-center justify-center">
-             {form.coverUrl ? <img src={form.coverUrl} className="w-full h-full object-cover" alt="Copertina" /> : <Book className="text-slate-400" size={48} />}
+          <div 
+            onDragOver={(e) => { e.preventDefault(); setIsDraggingCover(true); }}
+            onDragLeave={() => setIsDraggingCover(false)}
+            onDrop={handleCoverDrop}
+            className={`w-full max-w-[220px] aspect-[2/3] rounded-xl shadow border-2 overflow-hidden relative mb-4 flex flex-col items-center justify-center transition-all group cursor-pointer ${
+              isDraggingCover 
+                ? 'border-blue-500 bg-blue-100/50 scale-105 ring-4 ring-blue-300' 
+                : form.coverUrl 
+                  ? 'border-slate-300 bg-slate-200 hover:border-blue-400' 
+                  : 'border-dashed border-slate-300 bg-slate-100 hover:border-blue-400'
+            }`}
+          >
+             {form.coverUrl ? (
+               <img src={form.coverUrl} className="w-full h-full object-cover" alt="Copertina" />
+             ) : (
+               <div className="text-center p-4">
+                 <UploadCloud className="mx-auto text-slate-400 mb-2 group-hover:scale-110 transition-transform" size={40} />
+                 <p className="text-xs font-bold text-slate-600">Trascina qui l'immagine della copertina</p>
+                 <p className="text-[10px] text-slate-400 mt-1">da computer o browser</p>
+               </div>
+             )}
+
+             {/* Overlay d'aiuto Drag & Drop al mouse over */}
+             <div className={`absolute inset-0 bg-blue-900/70 text-white backdrop-blur-xs flex flex-col items-center justify-center p-3 text-center transition-opacity ${isDraggingCover ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`}>
+               <UploadCloud size={32} className="mb-1 animate-bounce" />
+               <span className="text-xs font-black">Rilascia l'immagine</span>
+               <span className="text-[10px] opacity-80 mt-0.5">per salvarla come copertina</span>
+             </div>
           </div>
-          <div className="w-full space-y-1.5">
-            <label className="text-[11px] font-bold text-slate-500 uppercase">Indirizzo URL Copertina</label>
-            <input type="text" placeholder="https://..." value={form.coverUrl} onChange={e=>updateField('coverUrl', e.target.value)} className="w-full text-xs p-2.5 border border-slate-300 rounded-lg outline-none focus:ring-2 focus:ring-blue-500 bg-white" />
+
+          <div className="w-full space-y-2">
+            <label className="inline-block w-full cursor-pointer">
+              <span className="w-full text-xs font-bold text-slate-700 bg-white hover:bg-slate-100 border border-slate-300 py-2.5 px-3 rounded-lg flex items-center justify-center gap-2 shadow-xs transition-colors cursor-pointer">
+                <ImageIcon size={15} /> Scegli Immagine da Computer
+              </span>
+              <input type="file" accept="image/*" onChange={handleCoverFileInput} className="hidden" />
+            </label>
+
+            <div>
+              <label className="text-[10px] font-bold text-slate-500 uppercase">Oppure incolla URL Copertina</label>
+              <input type="text" placeholder="https://..." value={form.coverUrl} onChange={e=>updateField('coverUrl', e.target.value)} className="w-full text-xs p-2 border border-slate-300 rounded-lg outline-none focus:ring-2 focus:ring-blue-500 bg-white mt-1" />
+            </div>
+
             <button onClick={async () => {
               if(!form.title) return showToast("Inserisci un titolo prima.", "info");
               const cover = await secureCoverFetch(form.title, form.lastName || form.firstName);
               if(cover) { updateField('coverUrl', cover); showToast("Copertina trovata!"); }
               else showToast("Nessuna copertina trovata sul web.", "info");
-            }} className="w-full text-xs font-bold text-blue-600 bg-blue-50 hover:bg-blue-100 py-2 rounded-lg transition-colors cursor-pointer">
-              🔍 Cerca Copertina HD
+            }} className="w-full text-xs font-bold text-blue-600 bg-blue-50 hover:bg-blue-100 py-2 rounded-lg transition-colors cursor-pointer flex items-center justify-center gap-1">
+              🔍 Cerca Copertina HD sul Web
             </button>
           </div>
         </div>
