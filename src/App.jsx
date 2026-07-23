@@ -397,6 +397,50 @@ export default function App() {
     const giaLetti = readBooks.slice(0, 15);
     const inProssimaLettura = books.filter(b => b.isNextRead).slice(0, 15);
 
+    // Gestori Drag & Drop tra le sezioni della Dashboard
+    const handleDragStart = (e, bookId) => {
+      e.dataTransfer.setData('text/plain', bookId);
+      e.dataTransfer.effectAllowed = 'move';
+    };
+
+    const handleDropOnSection = (e, targetSection) => {
+      e.preventDefault();
+      const bookId = e.dataTransfer.getData('text/plain');
+      if (!bookId) return;
+
+      const targetBook = books.find(b => b.id === bookId);
+      if (!targetBook) return;
+
+      let updatedBook = { ...targetBook };
+      if (targetSection === 'preferiti') {
+        updatedBook.rating = 5;
+        showToast(`"${targetBook.title}" spostato nei Preferiti (5★)!`);
+      } else if (targetSection === 'giaLetti') {
+        updatedBook.status = 'READ';
+        showToast(`"${targetBook.title}" spostato nei Già Letti!`);
+      } else if (targetSection === 'prossimaLettura') {
+        updatedBook.isNextRead = true;
+        showToast(`"${targetBook.title}" aggiunto a In Prossima Lettura!`);
+      }
+
+      saveBookToCloud(updatedBook);
+    };
+
+    const moveSection = (book, targetSection) => {
+      let updatedBook = { ...book };
+      if (targetSection === 'preferiti') {
+        updatedBook.rating = updatedBook.rating >= 4 ? 0 : 5;
+        showToast(updatedBook.rating > 0 ? `Aggiunto ai Preferiti` : `Rimosso dai Preferiti`, "info");
+      } else if (targetSection === 'giaLetti') {
+        updatedBook.status = updatedBook.status === 'READ' ? 'TO_READ' : 'READ';
+        showToast(`Stato aggiornato a: ${STATUSES[updatedBook.status]?.label}`, "info");
+      } else if (targetSection === 'prossimaLettura') {
+        updatedBook.isNextRead = !updatedBook.isNextRead;
+        showToast(updatedBook.isNextRead ? `Aggiunto a Prossima Lettura` : `Rimosso da Prossima Lettura`, "info");
+      }
+      saveBookToCloud(updatedBook);
+    };
+
     const handleConsiglioBibliotecario = async () => {
       setAiModal({ isOpen: true, title: 'Il Consiglio del Bibliotecario AI', content: '', loading: true });
       const lettiTitoli = readBooks.map(b => `${b.title} (${b.lastName})`).slice(0, 10).join(', ');
@@ -471,61 +515,132 @@ export default function App() {
           </button>
         </div>
 
+        {/* Le 3 Sezioni con Drag and Drop tra Colonne */}
         <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-          <Card className="p-4">
-            <h3 className="font-bold text-slate-800 mb-3 border-b pb-2 text-sm flex items-center gap-2">
-              <Star className="text-yellow-500 fill-yellow-500" size={16} /> I tuoi preferiti (4-5 ★)
-            </h3>
+          {/* Sezione 1: Preferiti */}
+          <Card 
+            onDragOver={(e) => e.preventDefault()} 
+            onDrop={(e) => handleDropOnSection(e, 'preferiti')} 
+            className="p-4 border-2 border-dashed border-transparent hover:border-yellow-300 transition-colors"
+          >
+            <div className="flex items-center justify-between mb-3 border-b pb-2">
+              <h3 className="font-bold text-slate-800 text-sm flex items-center gap-2">
+                <Star className="text-yellow-500 fill-yellow-500" size={16} /> I tuoi preferiti (4-5 ★)
+              </h3>
+              <span className="text-[10px] bg-yellow-100 text-yellow-800 font-bold px-2 py-0.5 rounded-full">Trascina qui</span>
+            </div>
             <div className="space-y-2.5 max-h-[380px] overflow-y-auto pr-1">
               {preferiti.length > 0 ? preferiti.map(b => (
-                <div key={b.id} onClick={() => openBookDetails(b)} className="flex items-center gap-3 p-2 hover:bg-slate-50 rounded-lg cursor-pointer transition-colors border border-transparent hover:border-slate-200">
-                  <div className="w-10 h-14 bg-slate-200 rounded overflow-hidden shrink-0 relative">
-                    {b.coverUrl ? <img src={b.coverUrl} className="w-full h-full object-cover" alt="Cover" /> : <Book className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 text-slate-400" size={16} />}
+                <div 
+                  key={b.id} 
+                  draggable 
+                  onDragStart={(e) => handleDragStart(e, b.id)}
+                  onClick={() => openBookDetails(b)} 
+                  className="flex items-center justify-between gap-2 p-2 hover:bg-slate-50 rounded-lg cursor-grab active:cursor-grabbing transition-colors border border-slate-100 hover:border-slate-300 group"
+                >
+                  <div className="flex items-center gap-3 overflow-hidden">
+                    <div className="w-10 h-14 bg-slate-200 rounded overflow-hidden shrink-0 relative shadow-xs">
+                      {b.coverUrl ? <img src={b.coverUrl} className="w-full h-full object-cover" alt="Cover" /> : <Book className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 text-slate-400" size={16} />}
+                    </div>
+                    <div className="overflow-hidden">
+                      <p className="text-xs font-bold text-slate-800 truncate group-hover:text-blue-600">{b.title}</p>
+                      <p className="text-[11px] text-slate-500 truncate">{b.lastName} {b.firstName}</p>
+                      <span className="text-[10px] text-yellow-500 font-bold">{b.rating} ★</span>
+                    </div>
                   </div>
-                  <div className="overflow-hidden">
-                    <p className="text-xs font-bold text-slate-800 truncate">{b.title}</p>
-                    <p className="text-[11px] text-slate-500 truncate">{b.lastName} {b.firstName}</p>
-                  </div>
+                  <button 
+                    title="Sposta o togli dai Preferiti" 
+                    onClick={(e) => { e.stopPropagation(); moveSection(b, 'preferiti'); }} 
+                    className="p-1 hover:bg-yellow-100 rounded text-yellow-600 text-[10px] font-bold cursor-pointer shrink-0"
+                  >
+                    ★
+                  </button>
                 </div>
-              )) : <p className="text-xs text-slate-400 italic py-4">Nessun libro preferito in lista.</p>}
+              )) : <p className="text-xs text-slate-400 italic py-6 text-center">Nessun libro preferito. Trascina un libro qui!</p>}
             </div>
           </Card>
 
-          <Card className="p-4">
-            <h3 className="font-bold text-slate-800 mb-3 border-b pb-2 text-sm flex items-center gap-2">
-              <CheckCircle className="text-emerald-500" size={16} /> Già letti
-            </h3>
+          {/* Sezione 2: Già Letti */}
+          <Card 
+            onDragOver={(e) => e.preventDefault()} 
+            onDrop={(e) => handleDropOnSection(e, 'giaLetti')} 
+            className="p-4 border-2 border-dashed border-transparent hover:border-emerald-300 transition-colors"
+          >
+            <div className="flex items-center justify-between mb-3 border-b pb-2">
+              <h3 className="font-bold text-slate-800 text-sm flex items-center gap-2">
+                <CheckCircle className="text-emerald-500" size={16} /> Già letti
+              </h3>
+              <span className="text-[10px] bg-emerald-100 text-emerald-800 font-bold px-2 py-0.5 rounded-full">Trascina qui</span>
+            </div>
             <div className="space-y-2.5 max-h-[380px] overflow-y-auto pr-1">
               {giaLetti.length > 0 ? giaLetti.map(b => (
-                <div key={b.id} onClick={() => openBookDetails(b)} className="flex items-center gap-3 p-2 hover:bg-slate-50 rounded-lg cursor-pointer transition-colors border border-transparent hover:border-slate-200">
-                  <div className="w-10 h-14 bg-slate-200 rounded overflow-hidden shrink-0 relative">
-                    {b.coverUrl ? <img src={b.coverUrl} className="w-full h-full object-cover" alt="Cover" /> : <Book className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 text-slate-400" size={16} />}
+                <div 
+                  key={b.id} 
+                  draggable 
+                  onDragStart={(e) => handleDragStart(e, b.id)}
+                  onClick={() => openBookDetails(b)} 
+                  className="flex items-center justify-between gap-2 p-2 hover:bg-slate-50 rounded-lg cursor-grab active:cursor-grabbing transition-colors border border-slate-100 hover:border-slate-300 group"
+                >
+                  <div className="flex items-center gap-3 overflow-hidden">
+                    <div className="w-10 h-14 bg-slate-200 rounded overflow-hidden shrink-0 relative shadow-xs">
+                      {b.coverUrl ? <img src={b.coverUrl} className="w-full h-full object-cover" alt="Cover" /> : <Book className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 text-slate-400" size={16} />}
+                    </div>
+                    <div className="overflow-hidden">
+                      <p className="text-xs font-bold text-slate-800 truncate group-hover:text-emerald-600">{b.title}</p>
+                      <p className="text-[11px] text-slate-500 truncate">{b.lastName} {b.firstName}</p>
+                    </div>
                   </div>
-                  <div className="overflow-hidden">
-                    <p className="text-xs font-bold text-slate-800 truncate">{b.title}</p>
-                    <p className="text-[11px] text-slate-500 truncate">{b.lastName} {b.firstName}</p>
-                  </div>
+                  <button 
+                    title="Segna come Da Leggere / Letto" 
+                    onClick={(e) => { e.stopPropagation(); moveSection(b, 'giaLetti'); }} 
+                    className="p-1 hover:bg-emerald-100 rounded text-emerald-700 text-[10px] font-bold cursor-pointer shrink-0"
+                  >
+                    ✓ Letto
+                  </button>
                 </div>
-              )) : <p className="text-xs text-slate-400 italic py-4">Nessun libro segnato come letto.</p>}
+              )) : <p className="text-xs text-slate-400 italic py-6 text-center">Nessun libro letto. Trascina un libro qui!</p>}
             </div>
           </Card>
 
-          <Card className="p-4">
-            <h3 className="font-bold text-slate-800 mb-3 border-b pb-2 text-sm flex items-center gap-2">
-              <Bookmark className="text-purple-500" size={16} /> In Prossima Lettura
-            </h3>
+          {/* Sezione 3: In Prossima Lettura */}
+          <Card 
+            onDragOver={(e) => e.preventDefault()} 
+            onDrop={(e) => handleDropOnSection(e, 'prossimaLettura')} 
+            className="p-4 border-2 border-dashed border-transparent hover:border-purple-300 transition-colors"
+          >
+            <div className="flex items-center justify-between mb-3 border-b pb-2">
+              <h3 className="font-bold text-slate-800 text-sm flex items-center gap-2">
+                <Bookmark className="text-purple-500" size={16} /> In Prossima Lettura
+              </h3>
+              <span className="text-[10px] bg-purple-100 text-purple-800 font-bold px-2 py-0.5 rounded-full">Trascina qui</span>
+            </div>
             <div className="space-y-2.5 max-h-[380px] overflow-y-auto pr-1">
               {inProssimaLettura.length > 0 ? inProssimaLettura.map(b => (
-                <div key={b.id} onClick={() => openBookDetails(b)} className="flex items-center gap-3 p-2 hover:bg-slate-50 rounded-lg cursor-pointer transition-colors border border-transparent hover:border-slate-200">
-                  <div className="w-10 h-14 bg-slate-200 rounded overflow-hidden shrink-0 relative">
-                    {b.coverUrl ? <img src={b.coverUrl} className="w-full h-full object-cover" alt="Cover" /> : <Book className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 text-slate-400" size={16} />}
+                <div 
+                  key={b.id} 
+                  draggable 
+                  onDragStart={(e) => handleDragStart(e, b.id)}
+                  onClick={() => openBookDetails(b)} 
+                  className="flex items-center justify-between gap-2 p-2 hover:bg-slate-50 rounded-lg cursor-grab active:cursor-grabbing transition-colors border border-slate-100 hover:border-slate-300 group"
+                >
+                  <div className="flex items-center gap-3 overflow-hidden">
+                    <div className="w-10 h-14 bg-slate-200 rounded overflow-hidden shrink-0 relative shadow-xs">
+                      {b.coverUrl ? <img src={b.coverUrl} className="w-full h-full object-cover" alt="Cover" /> : <Book className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 text-slate-400" size={16} />}
+                    </div>
+                    <div className="overflow-hidden">
+                      <p className="text-xs font-bold text-slate-800 truncate group-hover:text-purple-600">{b.title}</p>
+                      <p className="text-[11px] text-slate-500 truncate">{b.lastName} {b.firstName}</p>
+                    </div>
                   </div>
-                  <div className="overflow-hidden">
-                    <p className="text-xs font-bold text-slate-800 truncate">{b.title}</p>
-                    <p className="text-[11px] text-slate-500 truncate">{b.lastName} {b.firstName}</p>
-                  </div>
+                  <button 
+                    title="Togli da Prossima Lettura" 
+                    onClick={(e) => { e.stopPropagation(); moveSection(b, 'prossimaLettura'); }} 
+                    className="p-1 hover:bg-purple-100 rounded text-purple-700 text-[10px] font-bold cursor-pointer shrink-0"
+                  >
+                    🔖 Coda
+                  </button>
                 </div>
-              )) : <p className="text-xs text-slate-400 italic py-4">Nessun libro messo in coda.</p>}
+              )) : <p className="text-xs text-slate-400 italic py-6 text-center">Nessun libro in coda. Trascina un libro qui!</p>}
             </div>
           </Card>
         </div>
@@ -541,8 +656,14 @@ export default function App() {
     const [confirmingDelete, setConfirmingDelete] = useState(false);
 
     const filtered = books.filter(b => {
-      const matchSearch = (`${b.title} ${b.lastName} ${b.firstName}`).toLowerCase().includes(searchQ.toLowerCase());
-      const matchStatus = statusFilter === 'ALL' || b.status === statusFilter || (statusFilter === 'STELLE' && b.rating > 0);
+      if (!b) return false;
+      const title = (b.title || '').toString().toLowerCase();
+      const lastName = (b.lastName || '').toString().toLowerCase();
+      const firstName = (b.firstName || '').toString().toLowerCase();
+      const query = (searchQ || '').toString().trim().toLowerCase();
+      
+      const matchSearch = !query || title.includes(query) || lastName.includes(query) || firstName.includes(query) || `${firstName} ${lastName}`.includes(query) || `${lastName} ${firstName}`.includes(query);
+      const matchStatus = statusFilter === 'ALL' || b.status === statusFilter || (statusFilter === 'STELLE' && (b.rating || 0) > 0);
       return matchSearch && matchStatus;
     });
 
@@ -1079,7 +1200,37 @@ export default function App() {
       navigateTo('libreria');
     };
 
-    const [isDraggingCover, setIsDraggingCover] = useState(false);
+    const processAndSetCover = (rawUrl) => {
+      if (!rawUrl) return;
+      if (rawUrl.startsWith('data:image/')) {
+        const img = new Image();
+        img.onload = () => {
+          const canvas = document.createElement('canvas');
+          const maxW = 500;
+          let w = img.width;
+          let h = img.height;
+          if (w > maxW) {
+            h = Math.round((h * maxW) / w);
+            w = maxW;
+          }
+          canvas.width = w;
+          canvas.height = h;
+          const ctx = canvas.getContext('2d');
+          ctx.drawImage(img, 0, 0, w, h);
+          const compressed = canvas.toDataURL('image/jpeg', 0.85);
+          updateField('coverUrl', compressed);
+          showToast("Copertina salvata ed ottimizzata!", "success");
+        };
+        img.onerror = () => {
+          updateField('coverUrl', rawUrl);
+          showToast("Copertina aggiornata!", "success");
+        };
+        img.src = rawUrl;
+      } else {
+        updateField('coverUrl', rawUrl.trim());
+        showToast("Copertina aggiornata dall'URL!", "success");
+      }
+    };
 
     const handleCoverDrop = (e) => {
       e.preventDefault();
@@ -1090,8 +1241,7 @@ export default function App() {
         if (file.type.startsWith('image/')) {
           const reader = new FileReader();
           reader.onload = (event) => {
-            updateField('coverUrl', event.target.result);
-            showToast("Copertina salvata dall'immagine trascinata!");
+            processAndSetCover(event.target.result);
           };
           reader.readAsDataURL(file);
           return;
@@ -1100,8 +1250,7 @@ export default function App() {
 
       const droppedUrl = e.dataTransfer.getData('text/uri-list') || e.dataTransfer.getData('URL') || e.dataTransfer.getData('text/plain');
       if (droppedUrl && (droppedUrl.startsWith('http://') || droppedUrl.startsWith('https://') || droppedUrl.startsWith('data:image/'))) {
-        updateField('coverUrl', droppedUrl.trim());
-        showToast("Copertina aggiornata dall'URL trascinato!");
+        processAndSetCover(droppedUrl.trim());
       } else {
         showToast("Trascina un file immagine o un'immagine dal browser.", "info");
       }
@@ -1112,8 +1261,7 @@ export default function App() {
         const file = e.target.files[0];
         const reader = new FileReader();
         reader.onload = (event) => {
-          updateField('coverUrl', event.target.result);
-          showToast("Copertina caricata con successo!");
+          processAndSetCover(event.target.result);
         };
         reader.readAsDataURL(file);
       }
