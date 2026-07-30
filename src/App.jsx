@@ -10,7 +10,7 @@ import {
 const appId = typeof window !== 'undefined' && window.__app_id ? window.__app_id : 'libri-di-maurizio';
 
 // Incrementare a ogni modifica rilasciata (si parte da 2.0)
-const APP_VERSION = '2.7';
+const APP_VERSION = '2.8';
 
 const STATUSES = {
   ALL: { label: 'Tutti', value: 'ALL' },
@@ -100,7 +100,7 @@ const db = firestoreInstance;
 // Gemini API: rileva automaticamente i modelli disponibili e li testa con chiamate reali
 let verifiedModel = null;
 
-const callGeminiAPI = async (prompt, systemInstruction = "", useSearch = false, expectJson = false) => {
+const callGeminiAPI = async (prompt, systemInstruction = "", useSearch = false, expectJson = false, schema = null) => {
   const savedKey = (localStorage.getItem('gemini_api_key') || (import.meta.env ? import.meta.env.VITE_GEMINI_API_KEY : "") || "").trim();
   if (!savedKey) {
     throw new Error("CHIAVE_API_MANCANTE");
@@ -168,7 +168,13 @@ const callGeminiAPI = async (prompt, systemInstruction = "", useSearch = false, 
     // serve un JSON si rinuncia alla ricerca, che e' la combinazione che
     // faceva tornare sempre vuote le sezioni Bestseller e Novita'.
     if (useSearch && !expectJson) payload.tools = [{ "googleSearch": {} }];
-    if (expectJson) payload.generationConfig = { responseMimeType: "application/json" };
+    if (expectJson) {
+      payload.generationConfig = { responseMimeType: "application/json" };
+      // Con il solo responseMimeType il modello resta libero di incapsulare
+      // l'elenco in un oggetto ({"libri": [...]}). Lo schema impone la forma
+      // esatta ed e' cio' che rende la risposta davvero utilizzabile.
+      if (schema) payload.generationConfig.responseSchema = schema;
+    }
 
     try {
       let res = await fetch(url, {
@@ -452,6 +458,7 @@ export default function App() {
   // Paginazione delle 4 sezioni (limiti mostrati, incrementabili di 30 alla volta)
   const [limits, setLimits] = useState({
     inLettura: 30,
+    daScaricare: 30,
     preferiti: 30,
     giaLetti: 30,
     daLeggere: 30
@@ -471,6 +478,7 @@ export default function App() {
   const [giaLettiOrder, setGiaLettiOrder] = useState(() => loadOrder('giaLetti'));
   const [daLeggereOrder, setDaLeggereOrder] = useState(() => loadOrder('daLeggere'));
   const [libreriaOrder, setLibreriaOrder] = useState(() => loadOrder('libreria'));
+  const [daScaricareOrder, setDaScaricareOrder] = useState(() => loadOrder('daScaricare'));
   
   // Memorizzazione ultima ricerca ed esplorazione
   const [lastSearch, setLastSearch] = useState({
@@ -583,6 +591,7 @@ export default function App() {
             if (data.giaLettiOrder) setGiaLettiOrder(data.giaLettiOrder);
             if (data.daLeggereOrder) setDaLeggereOrder(data.daLeggereOrder);
             if (data.libreriaOrder) setLibreriaOrder(data.libreriaOrder);
+            if (data.daScaricareOrder) setDaScaricareOrder(data.daScaricareOrder);
             if (data.starFilters) {
               setStarFilters(data.starFilters);
               localStorage.setItem('libreria_star_filters', JSON.stringify(data.starFilters));
@@ -777,22 +786,29 @@ export default function App() {
     preferiti: setPreferitiOrder,
     giaLetti: setGiaLettiOrder,
     daLeggere: setDaLeggereOrder,
-    libreria: setLibreriaOrder
+    libreria: setLibreriaOrder,
+    daScaricare: setDaScaricareOrder
   };
   const ORDER_FIELDS = {
     inLettura: 'inLetturaOrder',
     preferiti: 'preferitiOrder',
     giaLetti: 'giaLettiOrder',
     daLeggere: 'daLeggereOrder',
-    libreria: 'libreriaOrder'
+    libreria: 'libreriaOrder',
+    daScaricare: 'daScaricareOrder'
   };
 
   const applyManualOrder = (list, orderIds) => {
     if (!orderIds || orderIds.length === 0) return list;
     const pos = new Map(orderIds.map((id, i) => [id, i]));
+    // I libri non presenti nell'ordine manuale sono quelli entrati nella
+    // sezione dopo l'ultimo riordino: vanno in cima, dove li metterebbe
+    // l'ordinamento automatico per data. Mandandoli in fondo (com'era prima)
+    // un libro appena letto finiva oltre il trecentesimo posto e spariva
+    // sotto il limite di 30 mostrati, facendo sembrare rotto il riordino.
     return [...list].sort((a, b) => {
-      const pa = pos.has(a.id) ? pos.get(a.id) : Number.MAX_SAFE_INTEGER;
-      const pb = pos.has(b.id) ? pos.get(b.id) : Number.MAX_SAFE_INTEGER;
+      const pa = pos.has(a.id) ? pos.get(a.id) : -1;
+      const pb = pos.has(b.id) ? pos.get(b.id) : -1;
       return pa - pb;
     });
   };
@@ -841,9 +857,9 @@ export default function App() {
     persistSectionOrder(sectionKey, newOrder);
   };
 
-  const handleAiCallWithCheck = async (prompt, systemInstruction = "", useSearch = false, expectJson = false) => {
+  const handleAiCallWithCheck = async (prompt, systemInstruction = "", useSearch = false, expectJson = false, schema = null) => {
     try {
-      return await callGeminiAPI(prompt, systemInstruction, useSearch, expectJson);
+      return await callGeminiAPI(prompt, systemInstruction, useSearch, expectJson, schema);
     } catch (err) {
       if (err.message === 'CHIAVE_API_MANCANTE') {
         setIsSettingsOpen(true);
@@ -872,6 +888,12 @@ export default function App() {
     const inLetturaBooks = applyManualOrder(
       books.filter(b => b.status === 'READING').sort(byRecent),
       inLetturaOrder
+    );
+
+    // Sezione "Da Scaricare": tutti i libri col flag, a prescindere dallo stato
+    const daScaricareBooks = applyManualOrder(
+      books.filter(b => b.daScaricare).sort(byRecent),
+      daScaricareOrder
     );
 
     // Sezione 2: Preferiti - 5 stelle, poi 4 stelle, poi updatedAt; infine ordine manuale
@@ -936,6 +958,9 @@ export default function App() {
       } else if (targetSection === 'preferiti') {
         updatedBook.rating = 5;
         showToast(`"${targetBook.title}" spostato nei Preferiti (5★)!`);
+      } else if (targetSection === 'daScaricare') {
+        updatedBook.daScaricare = true;
+        showToast(`"${targetBook.title}" segnato come Da Scaricare!`);
       } else if (targetSection === 'giaLetti') {
         updatedBook.status = 'READ';
         showToast(`"${targetBook.title}" spostato nei Già Letti!`);
@@ -1120,13 +1145,21 @@ export default function App() {
           </button>
         </div>
 
-        {/* Sezione 1: In Lettura - a tutta larghezza e in evidenza */}
-        <DashSection
-          title="📖 In Lettura" icon={BookOpen} iconClass="text-blue-600"
-          badgeClass="bg-blue-100 text-blue-800" books={inLetturaBooks}
-          limitKey="inLettura" dropTarget="inLettura" hero={true}
-          emptyMsg="Nessun libro in lettura. Trascina un libro qui per iniziare!"
-        />
+        {/* Riga superiore: In Lettura e Da Scaricare affiancate */}
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-6 items-start">
+          <DashSection
+            title="📖 In Lettura" icon={BookOpen} iconClass="text-blue-600"
+            badgeClass="bg-blue-100 text-blue-800" books={inLetturaBooks}
+            limitKey="inLettura" dropTarget="inLettura" hero={true}
+            emptyMsg="Nessun libro in lettura. Trascina un libro qui per iniziare!"
+          />
+          <DashSection
+            title="📥 Da Scaricare" icon={UploadCloud} iconClass="text-emerald-600"
+            badgeClass="bg-emerald-100 text-emerald-800" books={daScaricareBooks}
+            limitKey="daScaricare" dropTarget="daScaricare" hero={true}
+            emptyMsg="Nessun libro da scaricare. Segna un libro con 📥, oppure trascinalo qui."
+          />
+        </div>
 
         {/* Sezioni 2-4 affiancate */}
         <div className="grid grid-cols-1 md:grid-cols-3 gap-6 items-start">
@@ -1446,7 +1479,21 @@ export default function App() {
            prompt = `Considerando che apprezzo: ${letti || 'thriller e romanzi'}, suggerisci 12 novità editoriali. Rispondi ESCLUSIVAMENTE con un JSON valido: [{"title":"Titolo","author":"Autore","description":"Breve trama"}].`;
         }
         
-        const aiResponseText = await handleAiCallWithCheck(prompt, "Restituisci solo JSON valido.", true, true); 
+        const SCHEMA_LIBRI = {
+          type: "ARRAY",
+          items: {
+            type: "OBJECT",
+            properties: {
+              title: { type: "STRING" },
+              author: { type: "STRING" },
+              description: { type: "STRING" }
+            },
+            required: ["title", "author"]
+          }
+        };
+        const aiResponseText = await handleAiCallWithCheck(
+          prompt, "Restituisci solo JSON valido.", true, true, SCHEMA_LIBRI
+        );
         // Il modello a volte incornicia il JSON in un blocco markdown o lo
         // accompagna con del testo: si prova prima cosi' com'e', poi ripulito,
         // infine estraendo la prima parentesi quadra fino all'ultima.
@@ -1458,10 +1505,17 @@ export default function App() {
           const inizio = testo.indexOf('[');
           const fine = testo.lastIndexOf(']');
           if (inizio !== -1 && fine > inizio) tentativi.push(testo.slice(inizio, fine + 1));
+
           for (const t of tentativi) {
             try {
               const d = JSON.parse(t);
               if (Array.isArray(d)) return d;
+              // Il modello puo' incapsulare l'elenco in un oggetto, con un
+              // nome di campo qualsiasi: si prende il primo array trovato.
+              if (d && typeof d === 'object') {
+                const arr = Object.values(d).find(v => Array.isArray(v));
+                if (arr) return arr;
+              }
             } catch (e) {}
           }
           return null;
@@ -1470,7 +1524,10 @@ export default function App() {
         const parsedData = estraiJson(aiResponseText || '');
         if (!parsedData) {
           console.error("Risposta AI non interpretabile:", aiResponseText);
-          throw new Error("L'assistente ha risposto in un formato inatteso. Riprova.");
+          // Includere l'inizio della risposta e' l'unico modo per capire cosa
+          // ha risposto il modello senza aprire la console.
+          const anteprima = (aiResponseText || '(risposta vuota)').toString().slice(0, 120);
+          throw new Error(`Formato di risposta inatteso. L'assistente ha risposto: "${anteprima}…"`);
         }
         
         if (Array.isArray(parsedData) && parsedData.length > 0) {
@@ -1881,16 +1938,22 @@ export default function App() {
       if(!form.title) return showToast("Inserisci un titolo.", "info");
       setAiModal({ isOpen: true, title: 'Ricerca Info Web AI', content: 'Ricerca trama e copertina sul web...', loading: true });
       try {
-        const info = await handleAiCallWithCheck(`Cerca sul web la trama del libro "${form.title}" di ${form.lastName || form.firstName}. Riassumi in 3 paragrafi. In italiano.`, "", true); 
-        
-        let newCoverUrl = form.coverUrl;
-        if (!newCoverUrl) {
-          newCoverUrl = await secureCoverFetch(form.title, form.lastName || form.firstName);
-        }
+        const info = await handleAiCallWithCheck(`Cerca sul web la trama del libro "${form.title}" di ${form.lastName || form.firstName}. Riassumi in 3 paragrafi. In italiano.`, "", true);
+
+        // La copertina va cercata sempre: il pulsante si chiama "Cerca
+        // Trama/Cover", quindi saltarla quando ne esiste gia' una faceva
+        // sembrare la ricerca rotta. Se non si trova nulla si tiene quella
+        // attuale invece di cancellarla.
+        const coverTrovata = await secureCoverFetch(form.title, form.lastName || form.firstName);
+        const newCoverUrl = coverTrovata || form.coverUrl;
 
         setForm(prev => ({ ...prev, description: info, coverUrl: newCoverUrl }));
         setAiModal({ isOpen: false, title:'', content:'', loading: false });
-        showToast("Trama e Copertina recuperate!", "success");
+        // Messaggio veritiero: prima diceva "recuperate" anche senza copertina
+        showToast(
+          coverTrovata ? "Trama e copertina recuperate!" : "Trama recuperata. Nessuna copertina trovata sul web.",
+          coverTrovata ? "success" : "info"
+        );
       } catch(e) { 
         setAiModal({ isOpen: false, title:'', content:'', loading: false }); 
         showToast(e.message || "Errore durante la ricerca sul Web.", "error"); 
