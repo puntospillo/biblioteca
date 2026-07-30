@@ -10,7 +10,7 @@ import {
 const appId = typeof window !== 'undefined' && window.__app_id ? window.__app_id : 'libri-di-maurizio';
 
 // Incrementare a ogni modifica rilasciata (si parte da 2.0)
-const APP_VERSION = '3.1';
+const APP_VERSION = '3.2';
 
 const STATUSES = {
   ALL: { label: 'Tutti', value: 'ALL' },
@@ -518,6 +518,19 @@ export default function App() {
   const [isSyncing, setIsSyncing] = useState(false);
   // Avanzamento dell'importazione: { fatti, totale } oppure null
   const [importProgress, setImportProgress] = useState(null);
+  // Registro delle cancellazioni ("lapidi").
+  // Senza, la sincronizzazione non puo' distinguere un libro cancellato da uno
+  // non ancora caricato: un dispositivo che lo ha ancora in cache lo vede
+  // mancare dal cloud e lo ricarica, resuscitandolo su tutti gli altri.
+  const [deletedIds, setDeletedIds] = useState(() => {
+    try {
+      const salvato = localStorage.getItem('libreria_cancellati');
+      if (salvato) return JSON.parse(salvato);
+    } catch (e) {}
+    return [];
+  });
+  const deletedIdsRef = useRef([]);
+
   // Copia sempre aggiornata dei libri, leggibile dentro i callback di Firestore
   const booksRef = useRef([]);
   // Evita che una riconciliazione parta mentre un'altra e' in corso: ogni
@@ -611,8 +624,12 @@ export default function App() {
             cloudBooks.push(doc.data());
           });
 
-          const localBooks = booksRef.current || [];
-          const merged = mergeBooksLists(localBooks, cloudBooks);
+          // I libri cancellati vanno esclusi prima di ogni altra cosa: se
+          // rientrassero nella fusione verrebbero poi ricaricati sul cloud.
+          const cancellati = new Set(deletedIdsRef.current || []);
+          const localBooks = (booksRef.current || []).filter(b => !cancellati.has(b.id));
+          const merged = mergeBooksLists(localBooks, cloudBooks)
+            .filter(b => !cancellati.has(b.id));
           setBooks(merged);
           try {
             localStorage.setItem('myBooksData_cloud_cache', JSON.stringify(merged));
@@ -673,6 +690,16 @@ export default function App() {
             if (data.giaLettiOrder) setGiaLettiOrder(data.giaLettiOrder);
             if (data.daLeggereOrder) setDaLeggereOrder(data.daLeggereOrder);
             if (data.libreriaOrder) setLibreriaOrder(data.libreriaOrder);
+            // Cancellazioni fatte da un altro dispositivo: vanno applicate
+            // anche qui, altrimenti questo device continuerebbe a mostrarle
+            // e a ricaricarle sul cloud.
+            if (Array.isArray(data.deletedIds)) {
+              setDeletedIds(prev => [...new Set([...prev, ...data.deletedIds])].slice(-5000));
+              const daRimuovere = new Set(data.deletedIds);
+              setBooks(prev => prev.some(b => daRimuovere.has(b.id))
+                ? prev.filter(b => !daRimuovere.has(b.id))
+                : prev);
+            }
             if (data.daScaricareOrder) setDaScaricareOrder(data.daScaricareOrder);
             if (data.starFilters) {
               setStarFilters(data.starFilters);
@@ -699,6 +726,28 @@ export default function App() {
       unsubscribeSettings();
     };
   }, [user]);
+
+  // Il registro va tenuto anche in un ref: i callback di Firestore chiudono
+  // sullo stato del momento in cui sono stati creati e non lo vedrebbero.
+  useEffect(() => {
+    deletedIdsRef.current = deletedIds;
+    try { localStorage.setItem('libreria_cancellati', JSON.stringify(deletedIds)); } catch (e) {}
+  }, [deletedIds]);
+
+  // Registra una o piu' cancellazioni e le propaga agli altri dispositivi.
+  const registraCancellazioni = (ids) => {
+    if (!ids || ids.length === 0) return;
+    setDeletedIds(prev => {
+      const unione = [...new Set([...prev, ...ids])];
+      // Il registro non puo' crescere all'infinito: si conservano le ultime
+      // cancellazioni, abbastanza da coprire qualsiasi dispositivo rimasto
+      // indietro per settimane.
+      const limitato = unione.slice(-5000);
+      deletedIdsRef.current = limitato;
+      saveSettingsToCloud({ deletedIds: limitato });
+      return limitato;
+    });
+  };
 
   // Backup in LocalStorage come cache
   useEffect(() => {
@@ -864,20 +913,50 @@ export default function App() {
     showToast("Libro salvato con successo nella tua libreria!");
   };
 
+  // Unico punto di eliminazione, usato da scheda libro, eliminazione multipla
+  // e pulizia duplicati. Fa sempre tre cose, e tutte e tre servono:
+  // rimuove in locale, registra la lapide (senza, un altro dispositivo lo
+  // ricaricherebbe) e cancella dal database (senza, tornerebbe al ricarico).
+  const eliminaLibri = async (ids) => {
+    const elenco = [...new Set((ids || []).filter(Boolean))];
+    if (elenco.length === 0) return { eliminati: 0, falliti: 0 };
+
+    const daRimuovere = new Set(elenco);
+    setBooks(prev => prev.filter(b => !daRimuovere.has(b.id)));
+    registraCancellazioni(elenco);
+
+    if (!db || !user) return { eliminati: elenco.length, falliti: 0, soloLocale: true };
+
+    setSyncStatus('syncing');
+    let eliminati = 0;
+    let falliti = 0;
+    let primoErrore = null;
+    for (let i = 0; i < elenco.length; i += 200) {
+      const blocco = elenco.slice(i, i + 200);
+      try {
+        const batch = db.batch();
+        blocco.forEach(id => batch.delete(db.collection('books').doc(id)));
+        await batch.commit();
+        eliminati += blocco.length;
+      } catch (err) {
+        console.error("Errore eliminazione Firestore:", err?.code, err);
+        if (!primoErrore) primoErrore = err;
+        falliti += blocco.length;
+      }
+    }
+    setSyncStatus(falliti > 0 ? 'error' : 'synced');
+    return { eliminati, falliti, primoErrore };
+  };
+
   const deleteBookFromCloud = async (bookId) => {
     if (!bookId) return;
-    setBooks(prev => prev.filter(b => b.id !== bookId));
-    
-    if (db && user) {
-      setSyncStatus('syncing');
-      db.collection('books').doc(bookId).delete()
-        .then(() => setSyncStatus('synced'))
-        .catch(err => {
-          console.error("Errore eliminazione Firestore:", err);
-          setSyncStatus('error');
-        });
-    }
-    showToast("Libro eliminato dalla libreria!");
+    const { falliti, primoErrore } = await eliminaLibri([bookId]);
+    showToast(
+      falliti > 0
+        ? `Libro rimosso qui, ma non eliminato dal cloud (${primoErrore?.code || 'errore'}).`
+        : "Libro eliminato dalla libreria!",
+      falliti > 0 ? "error" : "success"
+    );
   };
 
   // --- Ordinamento manuale per sezione ---------------------------------
@@ -1395,45 +1474,29 @@ export default function App() {
       }
 
       const daEliminare = new Set(duplicatiDaEliminare);
-      setBooks(prev => prev.filter(b => !daEliminare.has(b.id)));
-
-      // Senza cancellarli anche da Firestore i duplicati tornavano al primo
-      // aggiornamento dal cloud, facendo sembrare la pulizia inefficace.
-      if (db && user) {
-        setSyncStatus('syncing');
-        let eliminati = 0;
-        let falliti = 0;
-        const elenco = [...daEliminare];
-        for (let i = 0; i < elenco.length; i += 200) {
-          const blocco = elenco.slice(i, i + 200);
-          try {
-            const batch = db.batch();
-            blocco.forEach(id => batch.delete(db.collection('books').doc(id)));
-            await batch.commit();
-            eliminati += blocco.length;
-          } catch (err) {
-            console.error("Errore eliminazione duplicati:", err?.code, err);
-            falliti += blocco.length;
-          }
-        }
-        setSyncStatus(falliti > 0 ? 'error' : 'synced');
-        showToast(
-          falliti > 0
-            ? `Rimossi ${eliminati} duplicati, ${falliti} non eliminati dal cloud.`
-            : `Pulizia completata. ${eliminati} duplicati rimossi.`,
-          falliti > 0 ? 'error' : 'success'
-        );
-      } else {
-        showToast(`Pulizia completata. ${duplicatiDaEliminare.length} duplicati rimossi in locale.`);
-      }
+      const { eliminati, falliti, primoErrore } = await eliminaLibri([...daEliminare]);
+      showToast(
+        falliti > 0
+          ? `Rimossi ${eliminati} duplicati, ${falliti} non eliminati dal cloud (${primoErrore?.code || 'errore'}).`
+          : `Pulizia completata. ${duplicatiDaEliminare.length} duplicati rimossi.`,
+        falliti > 0 ? 'error' : 'success'
+      );
     };
 
     const eseguiEliminazione = async () => {
       if (selectedIds.length === 0) return;
-      setBooks(prev => prev.filter(b => !selectedIds.includes(b.id)));
-      setSelectedIds([]);
+      const quanti = selectedIds.length;
       setConfirmingDelete(false);
-      showToast('Libri eliminati con successo.');
+      // Prima toglieva i libri solo dallo stato locale, senza mai cancellarli
+      // dal database: tornavano tutti al primo aggiornamento dal cloud.
+      const { falliti, primoErrore } = await eliminaLibri(selectedIds);
+      setSelectedIds([]);
+      showToast(
+        falliti > 0
+          ? `${quanti - falliti} libri eliminati. ${falliti} non rimossi dal cloud (${primoErrore?.code || 'errore'}).`
+          : `${quanti} libri eliminati.`,
+        falliti > 0 ? "error" : "success"
+      );
     };
 
     const aggiornaAIMultipla = async () => {
