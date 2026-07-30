@@ -10,7 +10,7 @@ import {
 const appId = typeof window !== 'undefined' && window.__app_id ? window.__app_id : 'libri-di-maurizio';
 
 // Incrementare a ogni modifica rilasciata (si parte da 2.0)
-const APP_VERSION = '2.5';
+const APP_VERSION = '2.6';
 
 const STATUSES = {
   ALL: { label: 'Tutti', value: 'ALL' },
@@ -163,7 +163,11 @@ const callGeminiAPI = async (prompt, systemInstruction = "", useSearch = false, 
       }
     };
     
-    if (useSearch) payload.tools = [{ "googleSearch": {} }];
+    // Attenzione: Gemini non accetta lo strumento di ricerca Google insieme
+    // all'output strutturato JSON — la richiesta viene rifiutata. Quando
+    // serve un JSON si rinuncia alla ricerca, che e' la combinazione che
+    // faceva tornare sempre vuote le sezioni Bestseller e Novita'.
+    if (useSearch && !expectJson) payload.tools = [{ "googleSearch": {} }];
     if (expectJson) payload.generationConfig = { responseMimeType: "application/json" };
 
     try {
@@ -359,50 +363,6 @@ export default function App() {
   const [fbProjectId, setFbProjectId] = useState(() => localStorage.getItem('fb_projectId') || '');
   const [fbAuthDomain, setFbAuthDomain] = useState(() => localStorage.getItem('fb_authDomain') || '');
   const [fbAppId, setFbAppId] = useState(() => localStorage.getItem('fb_appId') || '');
-
-  // Dynamic favicon & apple-touch-icon setup
-  useEffect(() => {
-    try {
-      const canvas = document.createElement('canvas');
-      canvas.width = 180;
-      canvas.height = 180;
-      const ctx = canvas.getContext('2d');
-      
-      const grad = ctx.createLinearGradient(0, 0, 180, 180);
-      grad.addColorStop(0, '#1e293b'); // slate-800
-      grad.addColorStop(1, '#0f172a'); // slate-900
-      ctx.fillStyle = grad;
-      
-      const r = 40;
-      ctx.beginPath();
-      ctx.moveTo(r, 0);
-      ctx.lineTo(180 - r, 0);
-      ctx.quadraticCurveTo(180, 0, 180, r);
-      ctx.lineTo(180, 180 - r);
-      ctx.quadraticCurveTo(180, 180, 180 - r, 180);
-      ctx.lineTo(r, 180);
-      ctx.quadraticCurveTo(0, 180, 0, 180 - r);
-      ctx.lineTo(0, r);
-      ctx.quadraticCurveTo(0, 0, r, 0);
-      ctx.closePath();
-      ctx.fill();
-      
-      ctx.font = '100px sans-serif';
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillText('📚', 90, 95);
-      
-      const pngUrl = canvas.toDataURL('image/png');
-      
-      const favLink = document.getElementById('dynamic-favicon');
-      if (favLink) favLink.href = pngUrl;
-      
-      const appLink = document.getElementById('dynamic-apple-icon');
-      if (appLink) appLink.href = pngUrl;
-    } catch (e) {
-      console.warn("Impossibile generare favicon dinamica:", e);
-    }
-  }, []);
 
   const [books, setBooks] = useState(() => {
     try {
@@ -1182,10 +1142,23 @@ export default function App() {
 
   // 2. Libreria View
   const LibreriaView = () => {
+    // Il campo di ricerca aggiorna testoRicerca a ogni tasto, ma il filtro usa
+    // searchQ, aggiornato con un ritardo: senza, ogni lettera rifiltrerebbe e
+    // ridisegnerebbe migliaia di schede e la digitazione risulterebbe bloccata.
+    const [testoRicerca, setTestoRicerca] = useState('');
     const [searchQ, setSearchQ] = useState('');
     const [statusFilter, setStatusFilter] = useState('ALL');
     const [selectedIds, setSelectedIds] = useState([]);
     const [confirmingDelete, setConfirmingDelete] = useState(false);
+    const [limiteVisibile, setLimiteVisibile] = useState(60);
+
+    useEffect(() => {
+      const t = setTimeout(() => setSearchQ(testoRicerca), 250);
+      return () => clearTimeout(t);
+    }, [testoRicerca]);
+
+    // Cambiando ricerca o filtro si riparte dall'inizio dell'elenco
+    useEffect(() => { setLimiteVisibile(60); }, [searchQ, statusFilter]);
 
     const filtered = books.filter(b => {
       if (!b) return false;
@@ -1193,13 +1166,30 @@ export default function App() {
       const lastName = (b.lastName || '').toString().toLowerCase();
       const firstName = (b.firstName || '').toString().toLowerCase();
       const query = (searchQ || '').toString().trim().toLowerCase();
-      
+
       const matchSearch = !query || title.includes(query) || lastName.includes(query) || firstName.includes(query) || `${firstName} ${lastName}`.includes(query) || `${lastName} ${firstName}`.includes(query);
       const matchStatus = statusFilter === 'ALL' || b.status === statusFilter || (statusFilter === 'STELLE' && (b.rating || 0) > 0);
       return matchSearch && matchStatus;
     });
+
+    // Ordine predefinito deterministico. Prima i già letti dal più recente,
+    // poi in lettura, poi da leggere. A parità, l'id come ultimo criterio:
+    // senza, l'ordine dipenderebbe da come Firestore restituisce i documenti,
+    // che cambia da un dispositivo all'altro.
+    const PESO_STATO = { READ: 0, READING: 1, TO_READ: 2 };
+    const ordinati = filtered.slice().sort((a, b) => {
+      const pa = PESO_STATO[a.status] ?? 3;
+      const pb = PESO_STATO[b.status] ?? 3;
+      if (pa !== pb) return pa - pb;
+      const ta = new Date(a.updatedAt || 0).getTime();
+      const tb = new Date(b.updatedAt || 0).getTime();
+      if (ta !== tb) return tb - ta;
+      return String(a.id).localeCompare(String(b.id));
+    });
+
     // L'ordine manuale della libreria ha priorità e viene sincronizzato
-    const ordered = applyManualOrder(filtered, libreriaOrder);
+    const ordered = applyManualOrder(ordinati, libreriaOrder);
+    const visibili = ordered.slice(0, limiteVisibile);
 
     const toggleSelect = (id) => setSelectedIds(prev => prev.includes(id) ? prev.filter(i => i !== id) : [...prev, id]);
     const selectAll = () => setSelectedIds(filtered.map(b => b.id));
@@ -1217,11 +1207,42 @@ export default function App() {
         }
       });
 
-      if (duplicatiDaEliminare.length > 0) {
-        setBooks(prev => prev.filter(b => !duplicatiDaEliminare.includes(b.id)));
-        showToast(`Pulizia completata. ${duplicatiDaEliminare.length} duplicati rimossi.`);
-      } else {
+      if (duplicatiDaEliminare.length === 0) {
         showToast("Nessun duplicato trovato nella tua libreria.", "info");
+        return;
+      }
+
+      const daEliminare = new Set(duplicatiDaEliminare);
+      setBooks(prev => prev.filter(b => !daEliminare.has(b.id)));
+
+      // Senza cancellarli anche da Firestore i duplicati tornavano al primo
+      // aggiornamento dal cloud, facendo sembrare la pulizia inefficace.
+      if (db && user) {
+        setSyncStatus('syncing');
+        let eliminati = 0;
+        let falliti = 0;
+        const elenco = [...daEliminare];
+        for (let i = 0; i < elenco.length; i += 200) {
+          const blocco = elenco.slice(i, i + 200);
+          try {
+            const batch = db.batch();
+            blocco.forEach(id => batch.delete(db.collection('books').doc(id)));
+            await batch.commit();
+            eliminati += blocco.length;
+          } catch (err) {
+            console.error("Errore eliminazione duplicati:", err?.code, err);
+            falliti += blocco.length;
+          }
+        }
+        setSyncStatus(falliti > 0 ? 'error' : 'synced');
+        showToast(
+          falliti > 0
+            ? `Rimossi ${eliminati} duplicati, ${falliti} non eliminati dal cloud.`
+            : `Pulizia completata. ${eliminati} duplicati rimossi.`,
+          falliti > 0 ? 'error' : 'success'
+        );
+      } else {
+        showToast(`Pulizia completata. ${duplicatiDaEliminare.length} duplicati rimossi in locale.`);
       }
     };
 
@@ -1239,23 +1260,41 @@ export default function App() {
       
       const booksToUpdate = books.filter(b => selectedIds.includes(b.id));
       let count = 0;
+      let saltati = 0;
+      let primoErrore = null;
 
       for (const b of booksToUpdate) {
-        if (!b.description) {
-          try {
-            const prompt = `Riassumi in massimo 50 parole la trama del libro "${b.title}" di ${b.lastName}. In italiano.`;
-            const trama = await handleAiCallWithCheck(prompt, "", true);
-            if (trama) {
-              await saveBookToCloud({ ...b, description: trama });
-              count++;
-            }
-          } catch(e) {}
+        // Chi ha gia' una trama viene saltato: rigenerarla sovrascriverebbe
+        // testi scritti a mano.
+        if (b.description) { saltati++; continue; }
+        try {
+          const prompt = `Riassumi in massimo 50 parole la trama del libro "${b.title}" di ${b.lastName}. In italiano.`;
+          const trama = await handleAiCallWithCheck(prompt, "", true);
+          if (trama) {
+            await saveBookToCloud({ ...b, description: trama });
+            count++;
+          }
+        } catch (e) {
+          // Prima l'errore veniva ingoiato da un catch vuoto: la funzione
+          // sembrava non fare nulla senza dire perche'.
+          if (!primoErrore) primoErrore = e;
+          console.error("Errore trama AI per", b.title, e);
         }
       }
-      
+
       setAiModal({ isOpen: false, title: '', content: '', loading: false });
       setSelectedIds([]);
-      showToast(`Aggiornate le trame di ${count} libri!`);
+
+      if (count === 0 && primoErrore) {
+        showToast(`Nessuna trama recuperata. ${primoErrore.message || 'Errore AI'}`, "error");
+      } else if (count === 0 && saltati > 0) {
+        showToast(`I ${saltati} libri selezionati hanno gia' una trama.`, "info");
+      } else {
+        showToast(
+          `Aggiornate le trame di ${count} libri.` + (saltati > 0 ? ` ${saltati} avevano gia' una trama.` : '') +
+          (primoErrore ? ` Alcune non recuperate: ${primoErrore.message || 'errore AI'}` : '')
+        );
+      }
     };
 
     return (
@@ -1264,7 +1303,7 @@ export default function App() {
           <div className="relative w-full lg:w-1/3 flex items-center">
             <Search className="absolute left-3 text-slate-400" size={18} />
             <input 
-              type="text" placeholder="Cerca per titolo o autore..." value={searchQ} onChange={(e) => setSearchQ(e.target.value)}
+              type="text" placeholder="Cerca per titolo o autore..." value={testoRicerca} onChange={(e) => setTestoRicerca(e.target.value)}
               className="w-full pl-10 pr-4 py-2 border border-slate-200 rounded-xl outline-none focus:ring-2 focus:ring-blue-500 text-sm"
             />
           </div>
@@ -1297,7 +1336,7 @@ export default function App() {
         </div>
 
         <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-4 mt-4">
-          {ordered.map((b, idx) => {
+          {visibili.map((b, idx) => {
             const isReading = b.status === 'READING';
             return (
               <div 
@@ -1343,7 +1382,7 @@ export default function App() {
                 )}
 
                 <div className="h-48 w-full bg-slate-50 flex-shrink-0 cursor-pointer overflow-hidden border-b border-slate-100 relative rounded-t-2xl" onClick={() => openBookDetails(b)}>
-                  {b.coverUrl ? <img src={b.coverUrl} className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300" alt="Cover" /> : <Book className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 text-slate-300" size={32}/>}
+                  {b.coverUrl ? <img src={b.coverUrl} loading="lazy" decoding="async" className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300" alt="Cover" /> : <Book className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 text-slate-300" size={32}/>}
                 </div>
                 <div className="p-3 flex flex-col flex-grow">
                   <h3 className="font-bold text-slate-800 text-xs line-clamp-2 leading-tight">{b.title}</h3>
@@ -1359,6 +1398,20 @@ export default function App() {
             );
           })}
         </div>
+
+        {ordered.length > limiteVisibile && (
+          <div className="mt-6 text-center">
+            <p className="text-xs text-slate-500 mb-2">
+              Mostrati {visibili.length} di {ordered.length} libri
+            </p>
+            <button
+              onClick={() => setLimiteVisibile(n => n + 60)}
+              className="px-6 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold rounded-xl cursor-pointer transition-colors"
+            >
+              Mostra altri 60
+            </button>
+          </div>
+        )}
       </div>
     );
   };
@@ -1379,13 +1432,30 @@ export default function App() {
         }
         
         const aiResponseText = await handleAiCallWithCheck(prompt, "Restituisci solo JSON valido.", true, true); 
-        let parsedData = [];
-        try {
-          parsedData = JSON.parse(aiResponseText);
-        } catch (e) {
-          console.warn("JSON parsing fallito, tentativo pulizia JSON");
-          const cleaned = aiResponseText.replace(/```json/g, '').replace(/```/g, '').trim();
-          parsedData = JSON.parse(cleaned);
+        // Il modello a volte incornicia il JSON in un blocco markdown o lo
+        // accompagna con del testo: si prova prima cosi' com'e', poi ripulito,
+        // infine estraendo la prima parentesi quadra fino all'ultima.
+        const estraiJson = (testo) => {
+          const tentativi = [
+            testo,
+            testo.replace(/```json/gi, '').replace(/```/g, '').trim()
+          ];
+          const inizio = testo.indexOf('[');
+          const fine = testo.lastIndexOf(']');
+          if (inizio !== -1 && fine > inizio) tentativi.push(testo.slice(inizio, fine + 1));
+          for (const t of tentativi) {
+            try {
+              const d = JSON.parse(t);
+              if (Array.isArray(d)) return d;
+            } catch (e) {}
+          }
+          return null;
+        };
+
+        const parsedData = estraiJson(aiResponseText || '');
+        if (!parsedData) {
+          console.error("Risposta AI non interpretabile:", aiResponseText);
+          throw new Error("L'assistente ha risposto in un formato inatteso. Riprova.");
         }
         
         if (Array.isArray(parsedData) && parsedData.length > 0) {
