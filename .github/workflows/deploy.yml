@@ -1,0 +1,59 @@
+# Pubblicazione su GitHub Pages.
+# Serve come alternativa a Netlify: su un repository pubblico i minuti di
+# esecuzione sono gratuiti e senza limiti, quindi il deploy non puo' fermarsi
+# per esaurimento crediti.
+name: Pubblica su GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  # Permette di lanciare la pubblicazione a mano dalla scheda Actions
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Se arrivano piu' commit ravvicinati, si pubblica solo l'ultimo
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Installa le dipendenze
+        run: npm ci
+
+      - name: Compila
+        run: npm run build
+
+      # enablement passa Pages da "servi il ramo così com'è" a "pubblica
+      # l'artefatto di questo workflow": senza, GitHub servirebbe i sorgenti
+      # non compilati, che il browser non sa eseguire.
+      - uses: actions/configure-pages@v5
+        with:
+          enablement: true
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
