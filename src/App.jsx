@@ -10,7 +10,7 @@ import {
 const appId = typeof window !== 'undefined' && window.__app_id ? window.__app_id : 'libri-di-maurizio';
 
 // Incrementare a ogni modifica rilasciata (si parte da 2.0)
-const APP_VERSION = '3.0';
+const APP_VERSION = '3.1';
 
 const STATUSES = {
   ALL: { label: 'Tutti', value: 'ALL' },
@@ -223,6 +223,82 @@ const callGeminiAPI = async (prompt, systemInstruction = "", useSearch = false, 
 };
 
 // Triple-Engine Cover Fetching (Apple Books -> Google Books -> OpenLibrary)
+// Novita' editoriali italiane da dati reali (classifiche Apple Books Italia).
+// Chiedere le classifiche a un modello linguistico non funziona: non le
+// conosce, e nel tentativo di inventarle produce titoli degeneri. Qui invece
+// i dati sono veri, aggiornati ogni giorno e non richiedono chiavi API.
+const pulisciHtml = (testo = '') => {
+  const t = document.createElement('textarea');
+  t.innerHTML = testo.replace(/<br\s*\/?>/gi, ' ').replace(/<[^>]+>/g, '');
+  return t.value.replace(/\s+/g, ' ').trim();
+};
+
+// Nota sulla scelta della fonte: il feed moderno
+// (rss.marketingtools.apple.com) non invia gli header CORS, quindi dal browser
+// e' inutilizzabile. Il feed storico su itunes.apple.com li invia, e in piu'
+// include gia' le trame: una sola richiesta per classifica.
+const dataDaFeed = (voce) => {
+  const iso = voce?.['im:releaseDate']?.label;
+  if (iso) {
+    const d = new Date(iso);
+    if (!isNaN(d)) return d;
+  }
+  // Ripiego sul formato visualizzato gg/mm/aaaa
+  const testo = voce?.['im:releaseDate']?.attributes?.label || '';
+  const m = testo.match(/(\d{2})\/(\d{2})\/(\d{4})/);
+  if (m) return new Date(`${m[3]}-${m[2]}-${m[1]}`);
+  return new Date(0);
+};
+
+const fetchNovitaItalia = async (quanti = 30) => {
+  const classifica = async (tipo) => {
+    const res = await fetch(`https://itunes.apple.com/it/rss/${tipo}/limit=100/json`);
+    if (!res.ok) throw new Error(`Il servizio classifiche ha risposto ${res.status}`);
+    const data = await res.json();
+    return data?.feed?.entry || [];
+  };
+
+  const [aPagamento, gratuiti] = await Promise.all([
+    classifica('toppaidebooks').catch(e => { console.warn('classifica a pagamento:', e); return []; }),
+    classifica('topfreeebooks').catch(e => { console.warn('classifica gratuiti:', e); return []; })
+  ]);
+
+  const tutti = [...aPagamento, ...gratuiti];
+  if (tutti.length === 0) {
+    throw new Error("Impossibile raggiungere il servizio delle classifiche italiane. Controlla la connessione e riprova.");
+  }
+
+  // Unisce le due classifiche, elimina i doppioni e privilegia le uscite piu'
+  // recenti: e' questo a renderlo un elenco di novita' e non un "best of",
+  // dove i classici di pubblico dominio occuperebbero le prime posizioni.
+  const perId = new Map();
+  tutti.forEach(v => {
+    const id = v?.id?.attributes?.['im:id'];
+    if (id && !perId.has(id)) perId.set(id, v);
+  });
+
+  const ordinati = [...perId.values()]
+    .sort((a, b) => dataDaFeed(b) - dataDaFeed(a))
+    .slice(0, quanti);
+
+  return ordinati.map(v => {
+    const immagini = v['im:image'] || [];
+    const piuGrande = immagini.length ? immagini[immagini.length - 1].label : '';
+    return {
+      volumeInfo: {
+        title: v['im:name']?.label || 'Senza titolo',
+        authors: [v['im:artist']?.label || 'Sconosciuto'],
+        description: pulisciHtml(v.summary?.label || ''),
+        publishedDate: dataDaFeed(v).toISOString(),
+        publisher: v['im:publisher']?.label || '',
+        infoLink: v.link?.attributes?.href || '',
+        // Le miniature del feed sono minuscole: la dimensione e' nell'URL
+        imageLinks: piuGrande ? { thumbnail: piuGrande.replace(/\/\d+x\d+bb/, '/600x600bb') } : null
+      }
+    };
+  });
+};
+
 const secureCoverFetch = async (title, author = '') => {
   const queryStr = encodeURIComponent(`${title} ${author}`.trim());
   
@@ -1546,92 +1622,32 @@ export default function App() {
   // 3. Esplora Online View
   const EsploraOnlineView = ({ mode, results, setResults }) => {
     const [loading, setLoading] = useState(false);
+    const [errore, setErrore] = useState('');
 
-    const cercaConAI = async () => {
+    const caricaNovita = async () => {
       setLoading(true);
+      setErrore('');
       try {
-        let prompt = "";
-        if (mode === 'bestseller') {
-          prompt = `Elenca i 12 libri bestseller più venduti in Italia negli ultimi mesi. Rispondi ESCLUSIVAMENTE con un JSON valido: [{"title":"Titolo","author":"Autore","description":"Breve trama"}].`;
+        const elenco = await fetchNovitaItalia(30);
+        if (elenco.length === 0) {
+          setErrore("Il servizio non ha restituito risultati. Riprova più tardi.");
         } else {
-           const letti = books.filter(b => b.rating >= 4).map(b => b.title).slice(0,5).join(", ");
-           prompt = `Considerando che apprezzo: ${letti || 'thriller e romanzi'}, suggerisci 12 novità editoriali. Rispondi ESCLUSIVAMENTE con un JSON valido: [{"title":"Titolo","author":"Autore","description":"Breve trama"}].`;
-        }
-        
-        const SCHEMA_LIBRI = {
-          type: "ARRAY",
-          items: {
-            type: "OBJECT",
-            properties: {
-              title: { type: "STRING" },
-              author: { type: "STRING" },
-              description: { type: "STRING" }
-            },
-            required: ["title", "author"]
-          }
-        };
-        const aiResponseText = await handleAiCallWithCheck(
-          prompt, "Restituisci solo JSON valido.", true, true, SCHEMA_LIBRI
-        );
-        // Il modello a volte incornicia il JSON in un blocco markdown o lo
-        // accompagna con del testo: si prova prima cosi' com'e', poi ripulito,
-        // infine estraendo la prima parentesi quadra fino all'ultima.
-        const estraiJson = (testo) => {
-          const tentativi = [
-            testo,
-            testo.replace(/```json/gi, '').replace(/```/g, '').trim()
-          ];
-          const inizio = testo.indexOf('[');
-          const fine = testo.lastIndexOf(']');
-          if (inizio !== -1 && fine > inizio) tentativi.push(testo.slice(inizio, fine + 1));
-
-          for (const t of tentativi) {
-            try {
-              const d = JSON.parse(t);
-              if (Array.isArray(d)) return d;
-              // Il modello puo' incapsulare l'elenco in un oggetto, con un
-              // nome di campo qualsiasi: si prende il primo array trovato.
-              if (d && typeof d === 'object') {
-                const arr = Object.values(d).find(v => Array.isArray(v));
-                if (arr) return arr;
-              }
-            } catch (e) {}
-          }
-          return null;
-        };
-
-        const parsedData = estraiJson(aiResponseText || '');
-        if (!parsedData) {
-          console.error("Risposta AI non interpretabile:", aiResponseText);
-          // Includere l'inizio della risposta e' l'unico modo per capire cosa
-          // ha risposto il modello senza aprire la console.
-          const anteprima = (aiResponseText || '(risposta vuota)').toString().slice(0, 120);
-          throw new Error(`Formato di risposta inatteso. L'assistente ha risposto: "${anteprima}…"`);
-        }
-        
-        if (Array.isArray(parsedData) && parsedData.length > 0) {
-            const formattedResults = await Promise.all(parsedData.map(async (item) => {
-                const coverUrl = await secureCoverFetch(item.title, item.author);
-                return {
-                    volumeInfo: { 
-                      title: item.title, 
-                      authors: [item.author], 
-                      description: item.description,
-                      imageLinks: coverUrl ? { thumbnail: coverUrl } : null
-                    }
-                };
-            }));
-            setResults(formattedResults);
-            showToast("Novità recuperate con AI!", "success");
-        } else {
-            showToast("Nessun risultato trovato.", "info");
+          setResults(elenco);
+          showToast(`${elenco.length} novità caricate dalle classifiche italiane.`);
         }
       } catch (e) {
-        showToast(e.message || "Errore durante la ricerca sul Web.", "error");
+        console.error("Errore caricamento novità:", e);
+        setErrore(e.message || "Impossibile caricare le novità.");
       } finally {
         setLoading(false);
       }
     };
+
+    // Al primo accesso l'elenco si carica da solo: non c'e' motivo di
+    // chiedere un clic per dei dati pubblici che non costano nulla.
+    useEffect(() => {
+      if (results.length === 0) caricaNovita();
+    }, []);
 
     const addDaEsplora = (item) => {
       const info = item.volumeInfo;
@@ -1654,16 +1670,31 @@ export default function App() {
       <div className="space-y-6 max-w-7xl mx-auto">
         <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 border-b border-slate-200 pb-4">
           <div>
-            <h2 className="text-xl font-bold text-slate-900">{mode === 'bestseller' ? 'Bestseller Italia' : 'Novità Consigliate'}</h2>
-            <p className="text-xs text-slate-500 mt-0.5">Scopri i libri più letti e consigliati sul web con l'intelligenza artificiale.</p>
+            <h2 className="text-xl font-bold text-slate-900">Novità Consigliate</h2>
+            <p className="text-xs text-slate-500 mt-0.5">
+              Le uscite più recenti dalle classifiche italiane di Apple Books, aggiornate ogni giorno.
+              {results.length > 0 && ` — ${results.length} titoli`}
+            </p>
           </div>
-          <button onClick={cercaConAI} className="bg-indigo-600 hover:bg-indigo-700 text-white px-5 py-2.5 rounded-xl font-bold text-xs flex items-center shadow-md w-full sm:w-auto justify-center transition-colors cursor-pointer">
-            <Wand2 size={16} className="mr-2"/> ✨ Genera Consigli con AI
+          <button onClick={caricaNovita} disabled={loading} className="bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white px-5 py-2.5 rounded-xl font-bold text-xs flex items-center shadow-md w-full sm:w-auto justify-center transition-colors cursor-pointer">
+            <RefreshCw size={16} className={`mr-2 ${loading ? 'animate-spin' : ''}`}/> Aggiorna elenco
           </button>
         </div>
 
+        {errore && (
+          <div className="bg-red-50 border border-red-200 text-red-800 rounded-xl p-4 text-sm flex items-start gap-3">
+            <X size={18} className="shrink-0 mt-0.5" />
+            <div>
+              <p className="font-bold mb-0.5">Non è stato possibile caricare le novità</p>
+              <p className="text-xs">{errore}</p>
+            </div>
+          </div>
+        )}
+
         {loading ? (
-          <div className="text-center py-20"><RefreshCw className="animate-spin mx-auto text-indigo-500 mb-4" size={32}/><p className="text-slate-600 font-medium text-sm">Ricerca e sintesi copertine in corso...</p></div>
+          <div className="text-center py-20"><RefreshCw className="animate-spin mx-auto text-indigo-500 mb-4" size={32}/><p className="text-slate-600 font-medium text-sm">Recupero delle novità dalle classifiche italiane...</p></div>
+        ) : results.length === 0 && !errore ? (
+          <p className="text-center text-slate-500 text-sm py-20">Nessuna novità disponibile al momento.</p>
         ) : (
           <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-4 gap-4">
             {results.map((item, idx) => (
@@ -1673,7 +1704,12 @@ export default function App() {
                      {item.volumeInfo.imageLinks?.thumbnail ? <img src={item.volumeInfo.imageLinks.thumbnail} className="w-full h-full object-cover" alt="Copertina"/> : <Book className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 text-slate-300" size={20}/>}
                   </div>
                   <h4 className="font-bold text-slate-900 text-xs line-clamp-2 mb-1">{item.volumeInfo.title}</h4>
-                  <p className="text-[11px] text-slate-500 mb-2 font-medium truncate">{item.volumeInfo.authors?.[0]}</p>
+                  <p className="text-[11px] text-slate-500 mb-1 font-medium truncate">{item.volumeInfo.authors?.[0]}</p>
+                  {item.volumeInfo.publishedDate && (
+                    <p className="text-[10px] text-slate-400 mb-2">
+                      Uscita: {new Date(item.volumeInfo.publishedDate).toLocaleDateString('it-IT', { day: 'numeric', month: 'short', year: 'numeric' })}
+                    </p>
+                  )}
                 </div>
                 <div className="mt-auto pt-2 border-t border-slate-100 flex flex-col gap-2">
                   <button onClick={() => setAiModal({ isOpen:true, title: item.volumeInfo.title, content: item.volumeInfo.description || 'Nessuna trama disponibile.', loading:false })} className="text-[11px] text-blue-600 font-semibold underline text-left cursor-pointer">Leggi Trama</button>
@@ -2614,9 +2650,6 @@ export default function App() {
             <button onClick={() => navigateTo('libreria')} className={`px-4 py-2 rounded-lg font-bold flex items-center whitespace-nowrap transition-colors cursor-pointer ${activeTab === 'libreria' ? 'bg-blue-600 text-white' : 'text-slate-300 hover:bg-slate-700'}`}>
               <Library size={15} className="mr-1.5" /> La Mia Libreria ({books.length})
             </button>
-            <button onClick={() => navigateTo('esplora_bestseller')} className={`px-4 py-2 rounded-lg font-bold flex items-center whitespace-nowrap transition-colors cursor-pointer ${activeTab === 'esplora_bestseller' ? 'bg-blue-600 text-white' : 'text-slate-300 hover:bg-slate-700'}`}>
-              <Sparkles size={15} className="mr-1.5 text-yellow-400" /> Bestseller Italia
-            </button>
             <button onClick={() => navigateTo('esplora_novita')} className={`px-4 py-2 rounded-lg font-bold flex items-center whitespace-nowrap transition-colors cursor-pointer ${activeTab === 'esplora_novita' ? 'bg-blue-600 text-white' : 'text-slate-300 hover:bg-slate-700'}`}>
               <Wand2 size={15} className="mr-1.5 text-indigo-400" /> Novità Consigliate
             </button>
@@ -2635,11 +2668,8 @@ export default function App() {
         <ErrorBoundary>
           {activeTab === 'dashboard' && <DashboardView />}
           {activeTab === 'libreria' && <LibreriaView />}
-          {activeTab === 'esplora_bestseller' && (
-            <EsploraOnlineView mode="bestseller" results={bestsellerResults} setResults={setBestsellerResults} />
-          )}
-          {activeTab === 'esplora_novita' && (
-            <EsploraOnlineView mode="novita" results={novitaResults} setResults={setNovitaResults} />
+          {(activeTab === 'esplora_novita' || activeTab === 'esplora_bestseller') && (
+            <EsploraOnlineView results={novitaResults} setResults={setNovitaResults} />
           )}
           {activeTab === 'cerca_online' && (
             <CercaOnlineView data={cercaResults} setData={setCercaResults} />
