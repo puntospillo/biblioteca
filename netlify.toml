@@ -1,0 +1,17 @@
+# Impostazioni di build esplicite e versionate: finora vivevano solo nel
+# pannello Netlify, dove non erano verificabili dal repository.
+[build]
+  command = "npm run build"
+  publish = "dist"
+
+[build.environment]
+  # Vite 5 richiede Node 18+. Fissare la versione evita che un cambio del
+  # default di Netlify rompa la build senza che nulla sia cambiato qui.
+  NODE_VERSION = "20"
+
+# L'app e' a pagina singola: la navigazione e' interna e non ci sono rotte
+# sul server, ma questa regola evita un 404 se si apre un indirizzo profondo.
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
