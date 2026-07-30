@@ -10,7 +10,7 @@ import {
 const appId = typeof window !== 'undefined' && window.__app_id ? window.__app_id : 'libri-di-maurizio';
 
 // Incrementare a ogni modifica rilasciata (si parte da 2.0)
-const APP_VERSION = '2.6';
+const APP_VERSION = '2.7';
 
 const STATUSES = {
   ALL: { label: 'Tutti', value: 'ALL' },
@@ -886,9 +886,11 @@ export default function App() {
     // Sezione 3: Già Letti - per data di ultima modifica, poi ordine manuale
     const giaLettiBooks = applyManualOrder(readBooks.slice().sort(byRecent), giaLettiOrder);
 
-    // Sezione 4: Da Leggere - due gruppi. I libri con flag "Da scaricare" restano
-    // nella sezione ma sempre in coda; l'ordine manuale vale dentro ogni gruppo.
-    const daLeggereAll = books.filter(b => b.status === 'TO_READ');
+    // Sezione 4: Da Leggere - solo i libri marcati "In Coda" (isNextRead).
+    // Con quasi 3000 libri da leggere, l'elenco completo e' inutilizzabile:
+    // qui va la selezione che si vuole leggere davvero.
+    // Restano due gruppi: quelli con flag "Da scaricare" sempre in fondo.
+    const daLeggereAll = books.filter(b => b.status === 'TO_READ' && b.isNextRead);
     const daLeggereG1 = applyManualOrder(
       daLeggereAll.filter(b => !b.daScaricare).sort(byRecent), daLeggereOrder
     );
@@ -938,8 +940,11 @@ export default function App() {
         updatedBook.status = 'READ';
         showToast(`"${targetBook.title}" spostato nei Già Letti!`);
       } else if (targetSection === 'daLeggere') {
+        // La sezione mostra solo i libri "In Coda": senza alzare il flag il
+        // libro trascinato qui sparirebbe subito dalla vista.
         updatedBook.status = 'TO_READ';
-        showToast(`"${targetBook.title}" spostato in Da Leggere!`);
+        updatedBook.isNextRead = true;
+        showToast(`"${targetBook.title}" messo in coda tra i Da Leggere!`);
       }
       saveBookToCloud(updatedBook);
     };
@@ -977,6 +982,15 @@ export default function App() {
       </button>
     );
 
+    // Interruttore "In Coda": determina chi compare nella sezione Da Leggere
+    const InCodaBadge = ({ book }) => (
+      <button onClick={(e) => { e.stopPropagation(); saveBookToCloud({...book, isNextRead: !book.isNextRead}); }}
+        title={book.isNextRead ? "Togli dalla coda di lettura" : "Metti in coda di lettura"}
+        className={`text-[10px] font-bold px-1.5 py-0.5 rounded cursor-pointer transition-colors ${book.isNextRead ? 'bg-purple-100 text-purple-700 border border-purple-300' : 'bg-slate-50 text-slate-400 border border-slate-200 hover:bg-slate-100'}`}>
+        🔖 {book.isNextRead ? 'In Coda' : 'Coda'}
+      </button>
+    );
+
     // Riga libro riutilizzabile. group = gruppo di appartenenza (serve per i
     // limiti dello spostamento su/giù e per il riordino via drag & drop).
     const BookRow = ({ book, sectionKey, group, fullOrder = null, hero = false }) => {
@@ -1001,6 +1015,7 @@ export default function App() {
             <div className="flex items-center gap-1.5 mt-0.5 flex-wrap">
               <InlineStars book={book} />
               <InlineStatus book={book} />
+              <InCodaBadge book={book} />
               <DaScaricareBadge book={book} />
             </div>
           </div>
@@ -1128,11 +1143,11 @@ export default function App() {
             emptyMsg="Nessun libro letto. Trascina un libro qui!"
           />
           <DashSection
-            title="📚 Da Leggere" icon={Circle} iconClass="text-amber-500"
+            title="📚 Da Leggere · In Coda" icon={Circle} iconClass="text-amber-500"
             badgeClass="bg-amber-100 text-amber-800" books={daLeggereBooks}
             groups={daLeggereGroups}
             limitKey="daLeggere" dropTarget="daLeggere"
-            emptyMsg="Nessun libro da leggere. Aggiungi libri dalla libreria!"
+            emptyMsg="Nessun libro in coda. Segna un libro con 🔖 Coda, oppure trascinalo qui."
           />
         </div>
       </div>
