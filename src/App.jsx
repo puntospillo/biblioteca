@@ -4,13 +4,13 @@ import {
   Book, Bookmark, Search, Layers, Trash2, Plus, Image as ImageIcon, 
   RefreshCw, Download, Upload, FileSpreadsheet, Loader2, Settings, 
   Key, X, ArrowLeft, Library, SlidersHorizontal, Share2, Copy,
-  ChevronUp, ChevronDown, UploadCloud, Move
+  ChevronUp, ChevronDown, UploadCloud, Move, ChevronsUp
 } from 'lucide-react';
 
 const appId = typeof window !== 'undefined' && window.__app_id ? window.__app_id : 'libri-di-maurizio';
 
 // Incrementare a ogni modifica rilasciata (si parte da 2.0)
-const APP_VERSION = '2.8';
+const APP_VERSION = '2.9';
 
 const STATUSES = {
   ALL: { label: 'Tutti', value: 'ALL' },
@@ -479,6 +479,12 @@ export default function App() {
   const [daLeggereOrder, setDaLeggereOrder] = useState(() => loadOrder('daLeggere'));
   const [libreriaOrder, setLibreriaOrder] = useState(() => loadOrder('libreria'));
   const [daScaricareOrder, setDaScaricareOrder] = useState(() => loadOrder('daScaricare'));
+  // Ultimo libro salvato: resta in cima a ogni elenco finche' non se ne salva
+  // un altro, cosi' dopo un salvataggio lo si ritrova subito invece di doverlo
+  // cercare tra migliaia di voci. Persistito per sopravvivere al ricaricamento.
+  const [ultimoSalvatoId, setUltimoSalvatoId] = useState(
+    () => { try { return localStorage.getItem('libreria_ultimo_salvato') || ''; } catch (e) { return ''; } }
+  );
   
   // Memorizzazione ultima ricerca ed esplorazione
   const [lastSearch, setLastSearch] = useState({
@@ -733,10 +739,30 @@ export default function App() {
     return { salvati, falliti, primoErrore };
   };
 
-  const saveBookToCloud = async (bookData) => {
+  // portaInCima: riservato ai salvataggi espliciti (scheda libro, aggiunta da
+  // ricerca web). Le modifiche rapide dalle righe — stelle, stato, flag —
+  // passano di qui a ogni clic: farle saltare in cima sposterebbe il libro
+  // sotto il dito mentre lo si sta usando.
+  const saveBookToCloud = async (bookData, { portaInCima = false } = {}) => {
     if (!bookData) return;
     const cleanBook = normalizeBook(bookData, user ? user.uid : 'local-user');
     const bookId = cleanBook.id;
+
+    if (portaInCima) {
+      setUltimoSalvatoId(bookId);
+      try { localStorage.setItem('libreria_ultimo_salvato', bookId); } catch (e) {}
+      // Se il libro compare in un ordine manuale resterebbe inchiodato alla
+      // sua vecchia posizione: togliendolo torna "non ordinato" e risale.
+      Object.keys(ORDER_FIELDS).forEach(sezione => {
+        const attuale = {
+          inLettura: inLetturaOrder, preferiti: preferitiOrder, giaLetti: giaLettiOrder,
+          daLeggere: daLeggereOrder, libreria: libreriaOrder, daScaricare: daScaricareOrder
+        }[sezione] || [];
+        if (attuale.includes(bookId)) {
+          persistSectionOrder(sezione, attuale.filter(id => id !== bookId));
+        }
+      });
+    }
 
     // Aggiorna lo stato locale immediatamente
     setBooks(prev => {
@@ -834,6 +860,17 @@ export default function App() {
     const ids = group.map(b => b.id);
     [ids[index], ids[targetIndex]] = [ids[targetIndex], ids[index]];
 
+    const newOrder = fullOrder
+      ? fullOrder.map(g => (g === group ? ids : g.map(b => b.id))).flat()
+      : ids;
+    persistSectionOrder(sectionKey, newOrder);
+  };
+
+  // Porta un libro al primo posto della sua sezione. Con liste di centinaia
+  // di voci, risalire premendo la freccia su decine di volte e' impraticabile.
+  const portaInCimaSezione = (sectionKey, group, bookId, fullOrder = null) => {
+    const ids = group.map(b => b.id).filter(id => id !== bookId);
+    ids.unshift(bookId);
     const newOrder = fullOrder
       ? fullOrder.map(g => (g === group ? ids : g.map(b => b.id))).flat()
       : ids;
@@ -1045,6 +1082,10 @@ export default function App() {
             </div>
           </div>
           <div className="flex flex-col gap-0.5 shrink-0">
+            <button title="Porta in cima alla sezione"
+              onClick={(e) => { e.stopPropagation(); portaInCimaSezione(sectionKey, group, book.id, fullOrder); }}
+              disabled={idx <= 0}
+              className="p-0.5 hover:bg-indigo-100 rounded text-indigo-500 hover:text-indigo-700 disabled:opacity-20 cursor-pointer"><ChevronsUp size={12} /></button>
             <button title="Sposta su"
               onClick={(e) => { e.stopPropagation(); moveInSection(sectionKey, group, book.id, 'up', fullOrder); }}
               disabled={idx <= 0}
@@ -1226,6 +1267,10 @@ export default function App() {
     // che cambia da un dispositivo all'altro.
     const PESO_STATO = { READ: 0, READING: 1, TO_READ: 2 };
     const ordinati = filtered.slice().sort((a, b) => {
+      // L'ultimo libro salvato precede tutto, anche i già letti: dopo averlo
+      // salvato deve essere sotto gli occhi, non da cercare.
+      if (a.id === ultimoSalvatoId && b.id !== ultimoSalvatoId) return -1;
+      if (b.id === ultimoSalvatoId && a.id !== ultimoSalvatoId) return 1;
       const pa = PESO_STATO[a.status] ?? 3;
       const pb = PESO_STATO[b.status] ?? 3;
       if (pa !== pb) return pa - pb;
@@ -1567,7 +1612,8 @@ export default function App() {
         description: info.description || '', 
         notes: ''
       };
-      saveBookToCloud(newBook);
+      // Aggiunta da Bestseller/Novità: deve comparire subito in cima
+      saveBookToCloud(newBook, { portaInCima: true });
     };
 
     return (
@@ -1962,7 +2008,9 @@ export default function App() {
 
     const handleSalva = () => {
       if(!form.title.trim()) return showToast("Il titolo è obbligatorio!", "error");
-      saveBookToCloud(form);
+      // Salvataggio esplicito dalla scheda (anche per i libri trovati con
+      // Cerca Web, che passano di qui): il libro va portato in cima
+      saveBookToCloud(form, { portaInCima: true });
       navigateTo('libreria');
     };
 
