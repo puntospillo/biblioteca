@@ -10,7 +10,7 @@ import {
 const appId = typeof window !== 'undefined' && window.__app_id ? window.__app_id : 'libri-di-maurizio';
 
 // Incrementare a ogni modifica rilasciata (si parte da 2.0)
-const APP_VERSION = '2.9';
+const APP_VERSION = '3.0';
 
 const STATUSES = {
   ALL: { label: 'Tutti', value: 'ALL' },
@@ -824,6 +824,17 @@ export default function App() {
     daScaricare: 'daScaricareOrder'
   };
 
+  // Filtro stelle a selezione multipla. 0 = libri senza valutazione.
+  // Elenco vuoto = nessun filtro attivo.
+  const toggleStarFilter = (valore) => {
+    setStarFilters(prev => {
+      const nuovo = prev.includes(valore) ? prev.filter(v => v !== valore) : [...prev, valore];
+      try { localStorage.setItem('libreria_star_filters', JSON.stringify(nuovo)); } catch (e) {}
+      saveSettingsToCloud({ starFilters: nuovo });
+      return nuovo;
+    });
+  };
+
   const applyManualOrder = (list, orderIds) => {
     if (!orderIds || orderIds.length === 0) return list;
     const pos = new Map(orderIds.map((id, i) => [id, i]));
@@ -1247,7 +1258,7 @@ export default function App() {
     }, [testoRicerca]);
 
     // Cambiando ricerca o filtro si riparte dall'inizio dell'elenco
-    useEffect(() => { setLimiteVisibile(60); }, [searchQ, statusFilter]);
+    useEffect(() => { setLimiteVisibile(60); }, [searchQ, statusFilter, starFilters]);
 
     const filtered = books.filter(b => {
       if (!b) return false;
@@ -1257,8 +1268,10 @@ export default function App() {
       const query = (searchQ || '').toString().trim().toLowerCase();
 
       const matchSearch = !query || title.includes(query) || lastName.includes(query) || firstName.includes(query) || `${firstName} ${lastName}`.includes(query) || `${lastName} ${firstName}`.includes(query);
-      const matchStatus = statusFilter === 'ALL' || b.status === statusFilter || (statusFilter === 'STELLE' && (b.rating || 0) > 0);
-      return matchSearch && matchStatus;
+      const matchStatus = statusFilter === 'ALL' || b.status === statusFilter;
+      // Filtro stelle: si combina con ricerca e stato. Vuoto = tutti.
+      const matchStelle = starFilters.length === 0 || starFilters.includes(Number(b.rating) || 0);
+      return matchSearch && matchStatus && matchStelle;
     });
 
     // Ordine predefinito deterministico. Prima i già letti dal più recente,
@@ -1418,14 +1431,35 @@ export default function App() {
         </div>
 
         <div className="flex gap-2 overflow-x-auto pb-2 scrollbar-hide items-center">
-          {['ALL', 'READ', 'TO_READ', 'READING', 'STELLE'].map(s => (
+          {['ALL', 'READ', 'TO_READ', 'READING'].map(s => (
             <button key={s} onClick={() => setStatusFilter(s)} className={`px-4 py-1.5 rounded-full text-xs font-bold whitespace-nowrap transition-colors cursor-pointer ${statusFilter === s ? 'bg-slate-800 text-white shadow-sm' : 'bg-white border border-slate-300 text-slate-600 hover:bg-slate-50'}`}>
-              {s === 'ALL' ? 'Tutti' : s === 'READ' ? 'Letti' : s === 'TO_READ' ? 'Da Leggere' : s === 'READING' ? 'In Lettura' : 'Valutati'}
+              {s === 'ALL' ? 'Tutti' : s === 'READ' ? 'Letti' : s === 'TO_READ' ? 'Da Leggere' : 'In Lettura'}
             </button>
           ))}
           <button onClick={() => { setSelectedBook(null); setActiveTab('scheda_libro'); }} className="ml-auto px-4 py-1.5 bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold rounded-full flex items-center shadow-sm whitespace-nowrap cursor-pointer">
             <Plus size={16} className="mr-1"/> Nuovo Libro Manuale
           </button>
+        </div>
+
+        {/* Filtro stelle a selezione multipla, sostituisce il vecchio "Valutati" */}
+        <div className="flex gap-2 overflow-x-auto pb-2 scrollbar-hide items-center">
+          <span className="text-xs font-bold text-slate-500 whitespace-nowrap shrink-0">Stelle:</span>
+          {[5, 4, 3, 2, 1, 0].map(v => {
+            const attivo = starFilters.includes(v);
+            return (
+              <button key={v} onClick={() => toggleStarFilter(v)}
+                title={v === 0 ? 'Libri senza valutazione' : `Libri con ${v} stelle`}
+                className={`px-3 py-1.5 rounded-full text-xs font-bold whitespace-nowrap transition-colors cursor-pointer flex items-center gap-1 ${attivo ? 'bg-yellow-400 text-yellow-950 shadow-sm border border-yellow-500' : 'bg-white border border-slate-300 text-slate-600 hover:bg-slate-50'}`}>
+                {v === 0 ? 'Senza voto' : <>{v} <Star size={11} className={attivo ? 'fill-yellow-900 text-yellow-900' : 'fill-yellow-400 text-yellow-400'} /></>}
+              </button>
+            );
+          })}
+          {starFilters.length > 0 && (
+            <button onClick={() => { setStarFilters([]); try { localStorage.setItem('libreria_star_filters', '[]'); } catch(e) {} saveSettingsToCloud({ starFilters: [] }); }}
+              className="px-3 py-1.5 rounded-full text-xs font-bold whitespace-nowrap bg-slate-100 hover:bg-slate-200 text-slate-600 cursor-pointer flex items-center gap-1">
+              <X size={12} /> Azzera
+            </button>
+          )}
         </div>
 
         <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-4 mt-4">
