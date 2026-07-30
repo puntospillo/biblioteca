@@ -16,9 +16,59 @@ const STATUSES = {
   READ: { label: 'Letti', value: 'READ', color: 'bg-emerald-100 text-emerald-800 border-emerald-200' }
 };
 
-// Safe access to Firebase globals if loaded via script, otherwise null
-const auth = typeof window !== 'undefined' && window.auth ? window.auth : null;
-const db = typeof window !== 'undefined' && window.db ? window.db : null;
+// Safe access to Firebase globals if loaded via script, otherwise initialize dynamically
+let firebaseApp = null;
+let authInstance = null;
+let firestoreInstance = null;
+
+const getFirebaseConfig = () => {
+  try {
+    const custom = localStorage.getItem('firebase_config');
+    if (custom) {
+      const parsed = JSON.parse(custom);
+      if (parsed && parsed.apiKey) return parsed;
+    }
+  } catch (e) {
+    console.error("Errore lettura firebase_config da localStorage:", e);
+  }
+  // Fallback default config per Maurizio
+  return {
+    apiKey: "AIzaSyA4Q_DEMO_SANDBOX_KEY_MAURIZIO",
+    authDomain: "libri-di-maurizio-sandbox.firebaseapp.com",
+    projectId: "libri-di-maurizio-sandbox",
+    storageBucket: "libri-di-maurizio-sandbox.appspot.com",
+    messagingSenderId: "123456789012",
+    appId: "1:123456789012:web:demo123456789"
+  };
+};
+
+if (typeof window !== 'undefined') {
+  if (window.auth && window.db) {
+    authInstance = window.auth;
+    firestoreInstance = window.db;
+  } else if (window.firebase) {
+    const config = getFirebaseConfig();
+    try {
+      if (window.firebase.apps.length === 0) {
+        firebaseApp = window.firebase.initializeApp(config);
+      } else {
+        firebaseApp = window.firebase.app();
+      }
+      authInstance = window.firebase.auth();
+      firestoreInstance = window.firebase.firestore();
+      
+      // Abilita persistenza offline (cache locale Firestore)
+      firestoreInstance.enablePersistence().catch((err) => {
+        console.warn("Persistenza offline Firestore non disponibile:", err.code);
+      });
+    } catch (e) {
+      console.error("Errore inizializzazione Firebase:", e);
+    }
+  }
+}
+
+const auth = authInstance;
+const db = firestoreInstance;
 
 // Gemini API: rileva automaticamente i modelli disponibili e li testa con chiamate reali
 let verifiedModel = null;
@@ -251,10 +301,81 @@ class ErrorBoundary extends React.Component {
   }
 }
 
+const mergeBooksLists = (local, cloud) => {
+  const mergedMap = new Map();
+  local.forEach(b => {
+    if (b.id) mergedMap.set(b.id, b);
+  });
+  cloud.forEach(cb => {
+    const lb = mergedMap.get(cb.id);
+    if (!lb) {
+      mergedMap.set(cb.id, cb);
+    } else {
+      const localTime = new Date(lb.updatedAt || 0).getTime();
+      const cloudTime = new Date(cb.updatedAt || 0).getTime();
+      if (cloudTime >= localTime) {
+        mergedMap.set(cb.id, cb);
+      }
+    }
+  });
+  return Array.from(mergedMap.values());
+};
+
 export default function App() {
   const [user, setUser] = useState(null);
   const [apiKey, setApiKey] = useState(() => localStorage.getItem('gemini_api_key') || '');
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
+  
+  // Firebase client-side config state
+  const [fbApiKey, setFbApiKey] = useState(() => localStorage.getItem('fb_apiKey') || '');
+  const [fbProjectId, setFbProjectId] = useState(() => localStorage.getItem('fb_projectId') || '');
+  const [fbAuthDomain, setFbAuthDomain] = useState(() => localStorage.getItem('fb_authDomain') || '');
+  const [fbAppId, setFbAppId] = useState(() => localStorage.getItem('fb_appId') || '');
+
+  // Dynamic favicon & apple-touch-icon setup
+  useEffect(() => {
+    try {
+      const canvas = document.createElement('canvas');
+      canvas.width = 180;
+      canvas.height = 180;
+      const ctx = canvas.getContext('2d');
+      
+      const grad = ctx.createLinearGradient(0, 0, 180, 180);
+      grad.addColorStop(0, '#1e293b'); // slate-800
+      grad.addColorStop(1, '#0f172a'); // slate-900
+      ctx.fillStyle = grad;
+      
+      const r = 40;
+      ctx.beginPath();
+      ctx.moveTo(r, 0);
+      ctx.lineTo(180 - r, 0);
+      ctx.quadraticCurveTo(180, 0, 180, r);
+      ctx.lineTo(180, 180 - r);
+      ctx.quadraticCurveTo(180, 180, 180 - r, 180);
+      ctx.lineTo(r, 180);
+      ctx.quadraticCurveTo(0, 180, 0, 180 - r);
+      ctx.lineTo(0, r);
+      ctx.quadraticCurveTo(0, 0, r, 0);
+      ctx.closePath();
+      ctx.fill();
+      
+      ctx.font = '100px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('📚', 90, 95);
+      
+      const pngUrl = canvas.toDataURL('image/png');
+      
+      const favLink = document.getElementById('dynamic-favicon');
+      if (favLink) favLink.href = pngUrl;
+      
+      const appLink = document.getElementById('dynamic-apple-icon');
+      if (appLink) appLink.href = pngUrl;
+    } catch (e) {
+      console.warn("Impossibile generare favicon dinamica:", e);
+    }
+  }, []);
 
   const [books, setBooks] = useState(() => {
     try {
@@ -274,8 +395,10 @@ export default function App() {
         status: 'READ',
         rating: 5,
         isNextRead: false,
+        daScaricare: false,
         description: 'Ambientato nel 1327 in un\'abbazia benedettina nell\'Italia settentrionale, il frate Guglielmo da Baskerville indaga su una serie di morti misteriose.',
         notes: 'Capolavoro assoluto della letteratura italiana.',
+        addedAt: new Date().toISOString(),
         updatedAt: new Date().toISOString()
       },
       {
@@ -287,8 +410,10 @@ export default function App() {
         status: 'READING',
         rating: 5,
         isNextRead: false,
+        daScaricare: false,
         description: 'Testimonianza drammatica e lucidissima dell\'esperienza dell\'autore nel campo di concentramento di Auschwitz.',
         notes: 'Lettura fondamentale per la memoria storica.',
+        addedAt: new Date().toISOString(),
         updatedAt: new Date().toISOString()
       },
       {
@@ -300,8 +425,10 @@ export default function App() {
         status: 'TO_READ',
         rating: 0,
         isNextRead: true,
+        daScaricare: true,
         description: 'Dialogo immaginario tra Marco Polo e l\'imperatore Kublai Khan sulle città dell\'impero.',
         notes: 'In coda per la lettura estiva.',
+        addedAt: new Date().toISOString(),
         updatedAt: new Date().toISOString()
       }
     ];
@@ -317,6 +444,144 @@ export default function App() {
   const [novitaResults, setNovitaResults] = useState([]);
   const [cercaResults, setCercaResults] = useState({ q: '', items: [] });
 
+  // Sincronizzazione e stati avanzati
+  const [syncStatus, setSyncStatus] = useState('offline'); // 'offline', 'syncing', 'synced', 'error'
+  const [isSyncing, setIsSyncing] = useState(false);
+  const [starFilters, setStarFilters] = useState(() => {
+    try {
+      const saved = localStorage.getItem('libreria_star_filters');
+      if (saved) return JSON.parse(saved);
+    } catch(e) {}
+    return []; // vuoto = tutti
+  });
+
+  // Paginazione delle 4 sezioni (limiti mostrati, incrementabili di 30 alla volta)
+  const [limits, setLimits] = useState({
+    inLettura: 30,
+    preferiti: 30,
+    giaLetti: 30,
+    daLeggere: 30
+  });
+
+  // Liste di ordinamento manuale persistenti
+  const [inLetturaOrder, setInLetturaOrder] = useState([]);
+  const [preferitiOrder, setPreferitiOrder] = useState([]);
+  const [giaLettiOrder, setGiaLettiOrder] = useState([]);
+  const [daLeggereOrder, setDaLeggereOrder] = useState([]);
+  
+  // Memorizzazione ultima ricerca ed esplorazione
+  const [lastSearch, setLastSearch] = useState({
+    bestseller: { query: '', results: [] },
+    novita: { query: '', results: [] }
+  });
+
+  // Funzione per salvare le impostazioni/ordine sul cloud
+  const saveSettingsToCloud = (updatedSettings) => {
+    if (!db || !user) return;
+    db.collection('users').doc(user.uid).collection('settings').doc('app')
+      .set(updatedSettings, { merge: true })
+      .catch(err => console.error("Errore salvataggio settings cloud:", err));
+  };
+
+  // Monitoraggio stato autenticazione
+  useEffect(() => {
+    if (!auth) return;
+    const unsubscribe = auth.onAuthStateChanged((firebaseUser) => {
+      setUser(firebaseUser);
+      if (firebaseUser) {
+        setSyncStatus('syncing');
+        showToast(`Accesso effettuato come ${firebaseUser.email}`);
+      } else {
+        setSyncStatus('offline');
+      }
+    });
+    return () => unsubscribe();
+  }, []);
+
+  // Sincronizzazione in tempo reale con Firestore
+  useEffect(() => {
+    if (!db || !user) {
+      setSyncStatus('offline');
+      return;
+    }
+
+    setIsSyncing(true);
+    setSyncStatus('syncing');
+
+    // Sottoscrizione ai libri
+    const unsubscribeBooks = db.collection('books')
+      .where('userId', '==', user.uid)
+      .onSnapshot(
+        (snapshot) => {
+          const cloudBooks = [];
+          snapshot.forEach((doc) => {
+            cloudBooks.push(doc.data());
+          });
+
+          setBooks((localBooks) => {
+            const merged = mergeBooksLists(localBooks, cloudBooks);
+
+            // Reconcile: carica sul database eventuali modifiche fatte localmente
+            localBooks.forEach(lb => {
+              const cb = cloudBooks.find(c => c.id === lb.id);
+              if (!cb || new Date(lb.updatedAt || 0).getTime() > new Date(cb.updatedAt || 0).getTime()) {
+                db.collection('books').doc(lb.id).set({ ...lb, userId: user.uid })
+                  .catch(err => console.error("Errore reconcile book:", lb.id, err));
+              }
+            });
+
+            try {
+              localStorage.setItem('myBooksData_cloud_cache', JSON.stringify(merged));
+            } catch (e) {}
+            return merged;
+          });
+          setSyncStatus('synced');
+          setIsSyncing(false);
+        },
+        (error) => {
+          console.error("Firestore Books Sync Error:", error);
+          setSyncStatus('error');
+          setIsSyncing(false);
+        }
+      );
+
+    // Sottoscrizione alle impostazioni (ordinamento manuale, filtri, ultima ricerca)
+    const unsubscribeSettings = db.collection('users').doc(user.uid).collection('settings').doc('app')
+      .onSnapshot(
+        (doc) => {
+          if (doc.exists) {
+            const data = doc.data();
+            if (data.inLetturaOrder) setInLetturaOrder(data.inLetturaOrder);
+            if (data.preferitiOrder) setPreferitiOrder(data.preferitiOrder);
+            if (data.giaLettiOrder) setGiaLettiOrder(data.giaLettiOrder);
+            if (data.daLeggereOrder) setDaLeggereOrder(data.daLeggereOrder);
+            if (data.starFilters) {
+              setStarFilters(data.starFilters);
+              localStorage.setItem('libreria_star_filters', JSON.stringify(data.starFilters));
+            }
+            if (data.lastSearch) {
+              setLastSearch(data.lastSearch);
+              if (data.lastSearch.bestseller && data.lastSearch.bestseller.results) {
+                setBestsellerResults(data.lastSearch.bestseller.results);
+              }
+              if (data.lastSearch.novita && data.lastSearch.novita.results) {
+                setNovitaResults(data.lastSearch.novita.results);
+              }
+            }
+          }
+        },
+        (error) => {
+          console.error("Firestore Settings Sync Error:", error);
+        }
+      );
+
+    return () => {
+      unsubscribeBooks();
+      unsubscribeSettings();
+    };
+  }, [user]);
+
+  // Backup in LocalStorage come cache
   useEffect(() => {
     try {
       localStorage.setItem('myBooksData_cloud_cache', JSON.stringify(books));
@@ -365,12 +630,21 @@ export default function App() {
       status: bookData.status || 'TO_READ',
       rating: Number(bookData.rating) || 0,
       isNextRead: !!bookData.isNextRead,
+      daScaricare: !!bookData.daScaricare,
       description: (bookData.description || '').trim(),
       notes: (bookData.notes || '').trim(),
+      comments: (bookData.comments || '').trim(),
+      addedAt: bookData.addedAt || new Date().toISOString(),
       updatedAt: new Date().toISOString(),
+      startReadDate: bookData.startReadDate || '',
+      endReadDate: bookData.endReadDate || '',
+      readingProgress: bookData.readingProgress || '',
+      readingPercentage: Number(bookData.readingPercentage) || 0,
+      currentPage: Number(bookData.currentPage) || 0,
       userId: user ? user.uid : 'local-user'
     };
 
+    // Aggiorna lo stato locale immediatamente
     setBooks(prev => {
       const exists = prev.some(b => b.id === bookId);
       if (exists) {
@@ -379,16 +653,39 @@ export default function App() {
       return [cleanBook, ...prev];
     });
 
+    // Salva su Firestore se connessi
+    if (db && user) {
+      setSyncStatus('syncing');
+      db.collection('books').doc(bookId).set(cleanBook)
+        .then(() => setSyncStatus('synced'))
+        .catch(err => {
+          console.error("Errore salvataggio Firestore:", err);
+          setSyncStatus('error');
+          showToast("Salvataggio locale eseguito. Sync cloud fallito.", "error");
+        });
+    }
+
     showToast("Libro salvato con successo nella tua libreria!");
   };
 
   const deleteBookFromCloud = async (bookId) => {
     if (!bookId) return;
     setBooks(prev => prev.filter(b => b.id !== bookId));
+    
+    if (db && user) {
+      setSyncStatus('syncing');
+      db.collection('books').doc(bookId).delete()
+        .then(() => setSyncStatus('synced'))
+        .catch(err => {
+          console.error("Errore eliminazione Firestore:", err);
+          setSyncStatus('error');
+        });
+    }
     showToast("Libro eliminato dalla libreria!");
   };
 
   const moveBook = (id, direction) => {
+    // Spostamento manuale all'interno del catalogo completo
     setBooks(prev => {
       const index = prev.findIndex(b => b.id === id);
       if (index === -1) return prev;
@@ -414,24 +711,43 @@ export default function App() {
     }
   };
 
-  // 1. Dashboard View
+  // 1. Dashboard View (Release 2.0 - 4 Sezioni)
   const DashboardView = () => {
     const total = books.length;
     const readBooks = books.filter(b => b.status === 'READ');
     const readCount = readBooks.length;
-    const toReadCount = books.filter(b => b.status === 'TO_READ' || b.status === 'READING').length;
+    const readingCount = books.filter(b => b.status === 'READING').length;
+    const toReadCount = books.filter(b => b.status === 'TO_READ').length;
     
     const ratedReadBooks = readBooks.filter(b => b.rating > 0);
     const avgRating = ratedReadBooks.length > 0 
       ? (ratedReadBooks.reduce((sum, b) => sum + Number(b.rating), 0) / ratedReadBooks.length).toFixed(1) 
       : '0.0';
 
-    const readingBooks = books.filter(b => b.status === 'READING');
-    const preferiti = books.filter(b => b.rating >= 4).slice(0, 15);
-    const giaLetti = readBooks.slice(0, 15);
-    const inProssimaLettura = books.filter(b => b.isNextRead).slice(0, 15);
+    // Sezione 1: In Lettura - ordinati per updatedAt desc
+    const inLetturaBooks = books.filter(b => b.status === 'READING')
+      .sort((a, b) => new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0));
 
-    // Gestori Drag & Drop tra le sezioni della Dashboard
+    // Sezione 2: Preferiti - 5 stelle poi 4 stelle, poi per updatedAt
+    const preferitiBooks = books.filter(b => (b.rating || 0) >= 4)
+      .sort((a, b) => {
+        if ((b.rating || 0) !== (a.rating || 0)) return (b.rating || 0) - (a.rating || 0);
+        return new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0);
+      });
+
+    // Sezione 3: Già Letti - ordinati per updatedAt desc
+    const giaLettiBooks = readBooks
+      .sort((a, b) => new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0));
+
+    // Sezione 4: Da Leggere - Gruppo 1 (senza daScaricare) poi Gruppo 2 (con daScaricare)
+    const daLeggereAll = books.filter(b => b.status === 'TO_READ');
+    const daLeggereG1 = daLeggereAll.filter(b => !b.daScaricare)
+      .sort((a, b) => new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0));
+    const daLeggereG2 = daLeggereAll.filter(b => !!b.daScaricare)
+      .sort((a, b) => new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0));
+    const daLeggereBooks = [...daLeggereG1, ...daLeggereG2];
+
+    // Drag & Drop
     const handleDragStart = (e, bookId) => {
       e.dataTransfer.setData('text/plain', bookId);
       e.dataTransfer.effectAllowed = 'move';
@@ -441,40 +757,118 @@ export default function App() {
       e.preventDefault();
       const bookId = e.dataTransfer.getData('text/plain');
       if (!bookId) return;
-
       const targetBook = books.find(b => b.id === bookId);
       if (!targetBook) return;
-
       let updatedBook = { ...targetBook };
-      if (targetSection === 'preferiti') {
+      if (targetSection === 'inLettura') {
+        updatedBook.status = 'READING';
+        showToast(`"${targetBook.title}" spostato In Lettura!`);
+      } else if (targetSection === 'preferiti') {
         updatedBook.rating = 5;
         showToast(`"${targetBook.title}" spostato nei Preferiti (5★)!`);
       } else if (targetSection === 'giaLetti') {
         updatedBook.status = 'READ';
         showToast(`"${targetBook.title}" spostato nei Già Letti!`);
-      } else if (targetSection === 'prossimaLettura') {
-        updatedBook.isNextRead = true;
-        showToast(`"${targetBook.title}" aggiunto a In Prossima Lettura!`);
-      }
-
-      saveBookToCloud(updatedBook);
-    };
-
-    const moveSection = (book, targetSection) => {
-      let updatedBook = { ...book };
-      if (targetSection === 'preferiti') {
-        updatedBook.rating = updatedBook.rating >= 4 ? 0 : 5;
-        showToast(updatedBook.rating > 0 ? `Aggiunto ai Preferiti` : `Rimosso dai Preferiti`, "info");
-      } else if (targetSection === 'giaLetti') {
-        updatedBook.status = updatedBook.status === 'READ' ? 'TO_READ' : 'READ';
-        showToast(`Stato aggiornato a: ${STATUSES[updatedBook.status]?.label}`, "info");
-      } else if (targetSection === 'prossimaLettura') {
-        updatedBook.isNextRead = !updatedBook.isNextRead;
-        showToast(updatedBook.isNextRead ? `Aggiunto a Prossima Lettura` : `Rimosso da Prossima Lettura`, "info");
+      } else if (targetSection === 'daLeggere') {
+        updatedBook.status = 'TO_READ';
+        showToast(`"${targetBook.title}" spostato in Da Leggere!`);
       }
       saveBookToCloud(updatedBook);
     };
 
+    // Inline Star Rating
+    const InlineStars = ({ book }) => (
+      <div className="flex gap-0.5">
+        {[1,2,3,4,5].map(s => (
+          <button key={s} onClick={(e) => { e.stopPropagation(); saveBookToCloud({...book, rating: book.rating === s ? 0 : s}); }}
+            className="cursor-pointer p-0 border-0 bg-transparent">
+            <Star size={12} className={s <= (book.rating || 0) ? 'fill-yellow-400 text-yellow-400' : 'text-slate-300'} />
+          </button>
+        ))}
+      </div>
+    );
+
+    // Inline Status Select
+    const InlineStatus = ({ book }) => (
+      <select value={book.status} 
+        onClick={(e) => e.stopPropagation()}
+        onChange={(e) => { e.stopPropagation(); saveBookToCloud({...book, status: e.target.value}); }}
+        className="text-[10px] font-bold bg-slate-100 border border-slate-200 rounded px-1 py-0.5 cursor-pointer outline-none">
+        <option value="TO_READ">Da Leggere</option>
+        <option value="READING">In Lettura</option>
+        <option value="READ">Già Letto</option>
+      </select>
+    );
+
+    // DaScaricare Toggle
+    const DaScaricareBadge = ({ book }) => (
+      <button onClick={(e) => { e.stopPropagation(); saveBookToCloud({...book, daScaricare: !book.daScaricare}); }}
+        title={book.daScaricare ? "Rimuovi flag Da Scaricare" : "Segna come Da Scaricare"}
+        className={`text-[10px] font-bold px-1.5 py-0.5 rounded cursor-pointer transition-colors ${book.daScaricare ? 'bg-emerald-100 text-emerald-700 border border-emerald-300' : 'bg-slate-50 text-slate-400 border border-slate-200 hover:bg-slate-100'}`}>
+        📥 {book.daScaricare ? 'Sì' : 'No'}
+      </button>
+    );
+
+    // Reusable Book Row per le sezioni
+    const BookRow = ({ book, idx, list, sectionColor = 'blue' }) => (
+      <div 
+        draggable onDragStart={(e) => handleDragStart(e, book.id)}
+        onClick={() => openBookDetails(book)} 
+        className={`flex items-center gap-2 p-2 hover:bg-slate-50 rounded-lg cursor-grab active:cursor-grabbing transition-colors border border-slate-100 hover:border-slate-300 group ${book.daScaricare ? 'bg-emerald-50/30' : ''}`}
+      >
+        <div className="w-9 h-13 bg-slate-200 rounded overflow-hidden shrink-0 relative shadow-xs">
+          {book.coverUrl ? <img src={book.coverUrl} className="w-full h-full object-cover" alt="" /> : <Book className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 text-slate-400" size={14} />}
+        </div>
+        <div className="flex-1 overflow-hidden min-w-0">
+          <p className="text-xs font-bold text-slate-800 truncate group-hover:text-blue-600">{book.title}</p>
+          <p className="text-[10px] text-slate-500 truncate">{book.lastName} {book.firstName}</p>
+          <div className="flex items-center gap-1.5 mt-0.5 flex-wrap">
+            <InlineStars book={book} />
+            <InlineStatus book={book} />
+            <DaScaricareBadge book={book} />
+          </div>
+        </div>
+        <div className="flex flex-col gap-0.5 shrink-0">
+          <button onClick={(e) => { e.stopPropagation(); moveBook(book.id, 'up'); }} disabled={idx === 0}
+            className="p-0.5 hover:bg-blue-100 rounded text-slate-500 hover:text-blue-700 disabled:opacity-20 cursor-pointer"><ChevronUp size={12} /></button>
+          <button onClick={(e) => { e.stopPropagation(); moveBook(book.id, 'down'); }} disabled={idx === list.length - 1}
+            className="p-0.5 hover:bg-blue-100 rounded text-slate-500 hover:text-blue-700 disabled:opacity-20 cursor-pointer"><ChevronDown size={12} /></button>
+        </div>
+      </div>
+    );
+
+    // Sezione generica riutilizzabile
+    const DashSection = ({ title, icon: Icon, iconClass, badgeClass, books: sectionBooks, limitKey, dropTarget, emptyMsg, highlight = false }) => {
+      const visibleBooks = sectionBooks.slice(0, limits[limitKey]);
+      const hasMore = sectionBooks.length > limits[limitKey];
+      return (
+        <Card 
+          onDragOver={(e) => e.preventDefault()} 
+          onDrop={(e) => handleDropOnSection(e, dropTarget)}
+          className={`p-4 border-2 border-dashed border-transparent hover:border-slate-300 transition-colors ${highlight ? 'bg-gradient-to-br from-blue-50 to-indigo-50 border-blue-200 shadow-md' : ''}`}
+        >
+          <div className="flex items-center justify-between mb-3 border-b pb-2">
+            <h3 className="font-bold text-slate-800 text-sm flex items-center gap-2">
+              <Icon className={iconClass} size={16} /> {title} ({sectionBooks.length})
+            </h3>
+            <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${badgeClass}`}>Trascina qui</span>
+          </div>
+          <div className="space-y-1.5 max-h-[600px] overflow-y-auto pr-1">
+            {visibleBooks.length > 0 ? visibleBooks.map((b, idx) => (
+              <BookRow key={b.id} book={b} idx={idx} list={visibleBooks} />
+            )) : <p className="text-xs text-slate-400 italic py-6 text-center">{emptyMsg}</p>}
+          </div>
+          {hasMore && (
+            <button onClick={() => setLimits(prev => ({...prev, [limitKey]: prev[limitKey] + 30}))}
+              className="w-full mt-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold rounded-xl cursor-pointer transition-colors">
+              Mostra altri ({sectionBooks.length - limits[limitKey]} rimanenti)
+            </button>
+          )}
+        </Card>
+      );
+    };
+
+    // AI Handlers
     const handleConsiglioBibliotecario = async () => {
       setAiModal({ isOpen: true, title: 'Il Consiglio del Bibliotecario AI', content: '', loading: true });
       const lettiTitoli = readBooks.map(b => `${b.title} (${b.lastName})`).slice(0, 10).join(', ');
@@ -501,6 +895,7 @@ export default function App() {
 
     return (
       <div className="space-y-6 max-w-7xl mx-auto">
+        {/* Stats */}
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
           <StatCard label="Totale Libri" value={total} icon={BookOpen} color="blue" />
           <StatCard label="Letti" value={readCount} icon={CheckCircle} color="green" />
@@ -508,38 +903,10 @@ export default function App() {
           <StatCard label="Media Voti (Letti)" value={`${avgRating} ★`} icon={Star} color="purple" />
         </div>
 
-        {/* Banner Speciale Libri In Lettura */}
-        {readingBooks.length > 0 && (
-          <div className="bg-gradient-to-r from-blue-600 via-indigo-600 to-blue-700 rounded-2xl p-5 text-white shadow-lg relative overflow-hidden">
-            <div className="flex items-center justify-between mb-4 border-b border-blue-400/30 pb-3">
-              <div className="flex items-center gap-2">
-                <span className="flex h-3 w-3 relative">
-                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-sky-400 opacity-75"></span>
-                  <span className="relative inline-flex rounded-full h-3 w-3 bg-sky-300"></span>
-                </span>
-                <h3 className="font-extrabold text-base tracking-wide flex items-center gap-2">
-                  📖 ATTUALMENTE IN LETTURA ({readingBooks.length})
-                </h3>
-              </div>
-              <button onClick={() => navigateTo('libreria')} className="text-xs bg-white/20 hover:bg-white/30 px-3 py-1 rounded-lg font-bold backdrop-blur-sm transition-all cursor-pointer">
-                Vedi Tutti in Libreria →
-              </button>
-            </div>
-            <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-3">
-              {readingBooks.map(b => (
-                <div key={b.id} onClick={() => openBookDetails(b)} className="bg-white/10 hover:bg-white/20 p-2.5 rounded-xl backdrop-blur-md transition-all cursor-pointer border border-white/20 hover:scale-[1.03] group">
-                  <div className="h-32 w-full bg-slate-800/40 rounded-lg overflow-hidden relative mb-2 shadow">
-                    {b.coverUrl ? <img src={b.coverUrl} className="w-full h-full object-cover" alt="Cover" /> : <Book className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 text-white/50" size={24} />}
-                    <span className="absolute top-1.5 right-1.5 bg-blue-500 text-white text-[9px] font-black px-1.5 py-0.5 rounded shadow">IN LETTURA</span>
-                  </div>
-                  <p className="text-xs font-bold text-white truncate group-hover:underline">{b.title}</p>
-                  <p className="text-[10px] text-blue-200 truncate">{b.lastName} {b.firstName}</p>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
+        {/* Versione */}
+        <p className="text-[10px] text-slate-400 text-right font-mono">Release v2.0</p>
 
+        {/* AI Buttons */}
         <div className="flex flex-col sm:flex-row gap-4">
           <button onClick={handleConsiglioBibliotecario} className="flex-1 bg-gradient-to-r from-purple-600 to-indigo-600 text-white px-6 py-4 rounded-xl font-bold shadow-md hover:shadow-lg transition-all flex items-center justify-center text-xs cursor-pointer">
             <Wand2 className="mr-2" size={18} /> ✨ Suggeriscimi un Libro con AI
@@ -549,138 +916,37 @@ export default function App() {
           </button>
         </div>
 
-        {/* Le 3 Sezioni con Drag and Drop tra Colonne */}
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-          {/* Sezione 1: Preferiti */}
-          <Card 
-            onDragOver={(e) => e.preventDefault()} 
-            onDrop={(e) => handleDropOnSection(e, 'preferiti')} 
-            className="p-4 border-2 border-dashed border-transparent hover:border-yellow-300 transition-colors"
-          >
-            <div className="flex items-center justify-between mb-3 border-b pb-2">
-              <h3 className="font-bold text-slate-800 text-sm flex items-center gap-2">
-                <Star className="text-yellow-500 fill-yellow-500" size={16} /> I tuoi preferiti (4-5 ★)
-              </h3>
-              <span className="text-[10px] bg-yellow-100 text-yellow-800 font-bold px-2 py-0.5 rounded-full">Trascina qui</span>
-            </div>
-            <div className="space-y-2.5 max-h-[380px] overflow-y-auto pr-1">
-              {preferiti.length > 0 ? preferiti.map(b => (
-                <div 
-                  key={b.id} 
-                  draggable 
-                  onDragStart={(e) => handleDragStart(e, b.id)}
-                  onClick={() => openBookDetails(b)} 
-                  className="flex items-center justify-between gap-2 p-2 hover:bg-slate-50 rounded-lg cursor-grab active:cursor-grabbing transition-colors border border-slate-100 hover:border-slate-300 group"
-                >
-                  <div className="flex items-center gap-3 overflow-hidden">
-                    <div className="w-10 h-14 bg-slate-200 rounded overflow-hidden shrink-0 relative shadow-xs">
-                      {b.coverUrl ? <img src={b.coverUrl} className="w-full h-full object-cover" alt="Cover" /> : <Book className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 text-slate-400" size={16} />}
-                    </div>
-                    <div className="overflow-hidden">
-                      <p className="text-xs font-bold text-slate-800 truncate group-hover:text-blue-600">{b.title}</p>
-                      <p className="text-[11px] text-slate-500 truncate">{b.lastName} {b.firstName}</p>
-                      <span className="text-[10px] text-yellow-500 font-bold">{b.rating} ★</span>
-                    </div>
-                  </div>
-                  <button 
-                    title="Sposta o togli dai Preferiti" 
-                    onClick={(e) => { e.stopPropagation(); moveSection(b, 'preferiti'); }} 
-                    className="p-1 hover:bg-yellow-100 rounded text-yellow-600 text-[10px] font-bold cursor-pointer shrink-0"
-                  >
-                    ★
-                  </button>
-                </div>
-              )) : <p className="text-xs text-slate-400 italic py-6 text-center">Nessun libro preferito. Trascina un libro qui!</p>}
-            </div>
-          </Card>
-
-          {/* Sezione 2: Già Letti */}
-          <Card 
-            onDragOver={(e) => e.preventDefault()} 
-            onDrop={(e) => handleDropOnSection(e, 'giaLetti')} 
-            className="p-4 border-2 border-dashed border-transparent hover:border-emerald-300 transition-colors"
-          >
-            <div className="flex items-center justify-between mb-3 border-b pb-2">
-              <h3 className="font-bold text-slate-800 text-sm flex items-center gap-2">
-                <CheckCircle className="text-emerald-500" size={16} /> Già letti
-              </h3>
-              <span className="text-[10px] bg-emerald-100 text-emerald-800 font-bold px-2 py-0.5 rounded-full">Trascina qui</span>
-            </div>
-            <div className="space-y-2.5 max-h-[380px] overflow-y-auto pr-1">
-              {giaLetti.length > 0 ? giaLetti.map(b => (
-                <div 
-                  key={b.id} 
-                  draggable 
-                  onDragStart={(e) => handleDragStart(e, b.id)}
-                  onClick={() => openBookDetails(b)} 
-                  className="flex items-center justify-between gap-2 p-2 hover:bg-slate-50 rounded-lg cursor-grab active:cursor-grabbing transition-colors border border-slate-100 hover:border-slate-300 group"
-                >
-                  <div className="flex items-center gap-3 overflow-hidden">
-                    <div className="w-10 h-14 bg-slate-200 rounded overflow-hidden shrink-0 relative shadow-xs">
-                      {b.coverUrl ? <img src={b.coverUrl} className="w-full h-full object-cover" alt="Cover" /> : <Book className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 text-slate-400" size={16} />}
-                    </div>
-                    <div className="overflow-hidden">
-                      <p className="text-xs font-bold text-slate-800 truncate group-hover:text-emerald-600">{b.title}</p>
-                      <p className="text-[11px] text-slate-500 truncate">{b.lastName} {b.firstName}</p>
-                    </div>
-                  </div>
-                  <button 
-                    title="Segna come Da Leggere / Letto" 
-                    onClick={(e) => { e.stopPropagation(); moveSection(b, 'giaLetti'); }} 
-                    className="p-1 hover:bg-emerald-100 rounded text-emerald-700 text-[10px] font-bold cursor-pointer shrink-0"
-                  >
-                    ✓ Letto
-                  </button>
-                </div>
-              )) : <p className="text-xs text-slate-400 italic py-6 text-center">Nessun libro letto. Trascina un libro qui!</p>}
-            </div>
-          </Card>
-
-          {/* Sezione 3: In Prossima Lettura */}
-          <Card 
-            onDragOver={(e) => e.preventDefault()} 
-            onDrop={(e) => handleDropOnSection(e, 'prossimaLettura')} 
-            className="p-4 border-2 border-dashed border-transparent hover:border-purple-300 transition-colors"
-          >
-            <div className="flex items-center justify-between mb-3 border-b pb-2">
-              <h3 className="font-bold text-slate-800 text-sm flex items-center gap-2">
-                <Bookmark className="text-purple-500" size={16} /> In Prossima Lettura
-              </h3>
-              <span className="text-[10px] bg-purple-100 text-purple-800 font-bold px-2 py-0.5 rounded-full">Trascina qui</span>
-            </div>
-            <div className="space-y-2.5 max-h-[380px] overflow-y-auto pr-1">
-              {inProssimaLettura.length > 0 ? inProssimaLettura.map(b => (
-                <div 
-                  key={b.id} 
-                  draggable 
-                  onDragStart={(e) => handleDragStart(e, b.id)}
-                  onClick={() => openBookDetails(b)} 
-                  className="flex items-center justify-between gap-2 p-2 hover:bg-slate-50 rounded-lg cursor-grab active:cursor-grabbing transition-colors border border-slate-100 hover:border-slate-300 group"
-                >
-                  <div className="flex items-center gap-3 overflow-hidden">
-                    <div className="w-10 h-14 bg-slate-200 rounded overflow-hidden shrink-0 relative shadow-xs">
-                      {b.coverUrl ? <img src={b.coverUrl} className="w-full h-full object-cover" alt="Cover" /> : <Book className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 text-slate-400" size={16} />}
-                    </div>
-                    <div className="overflow-hidden">
-                      <p className="text-xs font-bold text-slate-800 truncate group-hover:text-purple-600">{b.title}</p>
-                      <p className="text-[11px] text-slate-500 truncate">{b.lastName} {b.firstName}</p>
-                    </div>
-                  </div>
-                  <button 
-                    title="Togli da Prossima Lettura" 
-                    onClick={(e) => { e.stopPropagation(); moveSection(b, 'prossimaLettura'); }} 
-                    className="p-1 hover:bg-purple-100 rounded text-purple-700 text-[10px] font-bold cursor-pointer shrink-0"
-                  >
-                    🔖 Coda
-                  </button>
-                </div>
-              )) : <p className="text-xs text-slate-400 italic py-6 text-center">Nessun libro in coda. Trascina un libro qui!</p>}
-            </div>
-          </Card>
+        {/* 4 Sezioni Dashboard */}
+        <div className="space-y-6">
+          <DashSection 
+            title="📖 In Lettura" icon={BookOpen} iconClass="text-blue-600" 
+            badgeClass="bg-blue-100 text-blue-800" books={inLetturaBooks} 
+            limitKey="inLettura" dropTarget="inLettura" highlight={true}
+            emptyMsg="Nessun libro in lettura. Trascina un libro qui per iniziare!" 
+          />
+          <DashSection 
+            title="⭐ I tuoi Preferiti (4-5 ★)" icon={Star} iconClass="text-yellow-500 fill-yellow-500" 
+            badgeClass="bg-yellow-100 text-yellow-800" books={preferitiBooks} 
+            limitKey="preferiti" dropTarget="preferiti"
+            emptyMsg="Nessun libro preferito. Assegna 4 o 5 stelle a un libro!" 
+          />
+          <DashSection 
+            title="✓ Già Letti" icon={CheckCircle} iconClass="text-emerald-500" 
+            badgeClass="bg-emerald-100 text-emerald-800" books={giaLettiBooks} 
+            limitKey="giaLetti" dropTarget="giaLetti"
+            emptyMsg="Nessun libro letto. Trascina un libro qui!" 
+          />
+          <DashSection 
+            title="📚 Da Leggere" icon={Circle} iconClass="text-amber-500" 
+            badgeClass="bg-amber-100 text-amber-800" books={daLeggereBooks} 
+            limitKey="daLeggere" dropTarget="daLeggere"
+            emptyMsg="Nessun libro da leggere. Aggiungi libri dalla libreria!" 
+          />
         </div>
       </div>
     );
   };
+
 
   // 2. Libreria View
   const LibreriaView = () => {
@@ -1170,6 +1436,8 @@ export default function App() {
 
   // 6. Scheda Libro (Book Details & Editing View - Complete Repair)
   const SchedaLibro = () => {
+    const [isDraggingCover, setIsDraggingCover] = useState(false);
+
     const [form, setForm] = useState(() => ({
       id: selectedBook?.id || '',
       title: selectedBook?.title || '',
@@ -1510,6 +1778,178 @@ export default function App() {
     );
   };
 
+  // 7b. Auth Modal (Firebase Login / Register and Advanced Configuration)
+  const AuthModal = () => {
+    const [isRegister, setIsRegister] = useState(false);
+    const [email, setEmail] = useState('');
+    const [password, setPassword] = useState('');
+    const [loading, setLoading] = useState(false);
+    const [errorMsg, setErrorMsg] = useState('');
+    const [showAdvanced, setShowAdvanced] = useState(false);
+    
+    // Local state for advanced config overrides
+    const [localApiKey, setLocalApiKey] = useState(fbApiKey);
+    const [localProjectId, setLocalProjectId] = useState(fbProjectId);
+    const [localAuthDomain, setLocalAuthDomain] = useState(fbAuthDomain);
+    const [localAppId, setLocalAppId] = useState(fbAppId);
+
+    if (!isAuthModalOpen) return null;
+
+    const handleSubmit = async (e) => {
+      e.preventDefault();
+      if (!auth) {
+        showToast("Firebase non è inizializzato. Controlla la configurazione.", "error");
+        return;
+      }
+      if (!email || !password) {
+        setErrorMsg("Compila tutti i campi!");
+        return;
+      }
+
+      setLoading(true);
+      setErrorMsg('');
+      try {
+        if (isRegister) {
+          await auth.createUserWithEmailAndPassword(email, password);
+          showToast("Registrazione completata con successo!");
+        } else {
+          await auth.signInWithEmailAndPassword(email, password);
+          showToast("Accesso effettuato con successo!");
+        }
+        setIsAuthModalOpen(false);
+      } catch (err) {
+        console.error("Auth error:", err);
+        let msg = err.message;
+        if (err.code === 'auth/wrong-password') msg = "Password errata.";
+        else if (err.code === 'auth/user-not-found') msg = "Utente non trovato.";
+        else if (err.code === 'auth/email-already-in-use') msg = "Questo indirizzo email è già registrato.";
+        else if (err.code === 'auth/weak-password') msg = "La password deve contenere almeno 6 caratteri.";
+        setErrorMsg(msg);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    const handleSaveConfig = () => {
+      localStorage.setItem('fb_apiKey', localApiKey.trim());
+      localStorage.setItem('fb_projectId', localProjectId.trim());
+      localStorage.setItem('fb_authDomain', localAuthDomain.trim());
+      localStorage.setItem('fb_appId', localAppId.trim());
+      
+      setFbApiKey(localApiKey.trim());
+      setFbProjectId(localProjectId.trim());
+      setFbAuthDomain(localAuthDomain.trim());
+      setFbAppId(localAppId.trim());
+      
+      showToast("Configurazione Firebase salvata! Ricarica per applicare.", "info");
+    };
+
+    return (
+      <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+        <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-xl space-y-4 border border-slate-200 overflow-y-auto max-h-[90vh]">
+          <div className="flex justify-between items-center border-b pb-3">
+            <h3 className="font-bold text-slate-900 text-base flex items-center gap-2">
+              <UploadCloud size={18} className="text-blue-600" /> 
+              {isRegister ? 'Registrati su Libri Cloud' : 'Accedi a Libri Cloud'}
+            </h3>
+            <button onClick={() => setIsAuthModalOpen(false)} className="text-slate-400 hover:text-slate-600 cursor-pointer">
+              <X size={20} />
+            </button>
+          </div>
+
+          <p className="text-xs text-slate-500 leading-relaxed">
+            Accedi per sincronizzare automaticamente i tuoi libri, le note, le valutazioni in stelle e l'ordine di lettura su tutti i tuoi dispositivi.
+          </p>
+
+          {errorMsg && (
+            <div className="bg-red-50 text-red-700 p-3 rounded-xl text-xs font-semibold border border-red-200">
+              ⚠️ {errorMsg}
+            </div>
+          )}
+
+          <form onSubmit={handleSubmit} className="space-y-3">
+            <div>
+              <label className="text-[11px] font-bold text-slate-700 uppercase block mb-1">Indirizzo Email</label>
+              <input 
+                type="email" 
+                value={email} 
+                onChange={e => setEmail(e.target.value)}
+                placeholder="maurizio@example.com" 
+                className="w-full p-2.5 border border-slate-300 rounded-xl text-sm outline-none focus:ring-2 focus:ring-blue-500"
+                required
+              />
+            </div>
+
+            <div>
+              <label className="text-[11px] font-bold text-slate-700 uppercase block mb-1">Password</label>
+              <input 
+                type="password" 
+                value={password} 
+                onChange={e => setPassword(e.target.value)}
+                placeholder="••••••" 
+                className="w-full p-2.5 border border-slate-300 rounded-xl text-sm outline-none focus:ring-2 focus:ring-blue-500"
+                required
+              />
+            </div>
+
+            <Button onClick={handleSubmit} loading={loading} className="w-full py-2.5 mt-2">
+              {isRegister ? 'Crea Account' : 'Accedi'}
+            </Button>
+          </form>
+
+          <div className="text-center text-xs">
+            <button 
+              onClick={() => { setIsRegister(!isRegister); setErrorMsg(''); }}
+              className="text-blue-600 hover:underline font-bold cursor-pointer"
+            >
+              {isRegister ? 'Hai già un account? Accedi' : 'Non hai un account? Registrati'}
+            </button>
+          </div>
+
+          <div className="border-t pt-3">
+            <button 
+              onClick={() => setShowAdvanced(!showAdvanced)} 
+              className="text-xs font-bold text-slate-600 hover:text-slate-900 flex items-center justify-between w-full cursor-pointer"
+            >
+              <span>⚙️ Opzioni Database Firebase Avanzate</span>
+              <span>{showAdvanced ? '▲' : '▼'}</span>
+            </button>
+
+            {showAdvanced && (
+              <div className="mt-3 space-y-2.5 bg-slate-50 p-3 rounded-xl border border-slate-200 text-xs">
+                <p className="text-[10px] text-slate-500 mb-2">
+                  Inserisci le credenziali del tuo database Firebase personale per memorizzare i dati nel tuo cloud privato.
+                </p>
+                <div>
+                  <label className="text-[9px] font-bold text-slate-600 block mb-0.5">Firebase API Key</label>
+                  <input type="password" value={localApiKey} onChange={e=>setLocalApiKey(e.target.value)} placeholder="AIzaSy..." className="w-full p-1.5 border border-slate-300 rounded text-xs" />
+                </div>
+                <div>
+                  <label className="text-[9px] font-bold text-slate-600 block mb-0.5">Project ID</label>
+                  <input type="text" value={localProjectId} onChange={e=>setLocalProjectId(e.target.value)} placeholder="my-project-123" className="w-full p-1.5 border border-slate-300 rounded text-xs" />
+                </div>
+                <div>
+                  <label className="text-[9px] font-bold text-slate-600 block mb-0.5">Auth Domain</label>
+                  <input type="text" value={localAuthDomain} onChange={e=>setLocalAuthDomain(e.target.value)} placeholder="my-project-123.firebaseapp.com" className="w-full p-1.5 border border-slate-300 rounded text-xs" />
+                </div>
+                <div>
+                  <label className="text-[9px] font-bold text-slate-600 block mb-0.5">App ID</label>
+                  <input type="text" value={localAppId} onChange={e=>setLocalAppId(e.target.value)} placeholder="1:123456789:web:123" className="w-full p-1.5 border border-slate-300 rounded text-xs" />
+                </div>
+                <button 
+                  onClick={handleSaveConfig}
+                  className="w-full py-1.5 bg-slate-800 text-white font-bold rounded text-xs hover:bg-slate-900 cursor-pointer"
+                >
+                  Salva Configurazione Privata
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  };
+
   // 8. Reusable AI Response Modal
   const AiModalView = () => {
     const [copied, setCopied] = useState(false);
@@ -1573,6 +2013,9 @@ export default function App() {
       {/* Settings Modal */}
       <SettingsModal />
 
+      {/* Auth Modal */}
+      <AuthModal />
+
       {/* AI Modal */}
       <AiModalView />
 
@@ -1590,6 +2033,43 @@ export default function App() {
           </div>
 
           <div className="flex items-center gap-2">
+            {/* Sync status indicator */}
+            <div className="flex items-center gap-1 bg-slate-800 border border-slate-700 p-1.5 rounded-lg text-xs font-medium">
+              {syncStatus === 'synced' && <UploadCloud size={14} className="text-emerald-400" title="Sincronizzato Cloud" />}
+              {syncStatus === 'syncing' && <RefreshCw size={14} className="text-blue-400 animate-spin" title="Sincronizzazione..." />}
+              {syncStatus === 'error' && <UploadCloud size={14} className="text-red-400" title="Errore Sincronizzazione" />}
+              {syncStatus === 'offline' && <UploadCloud size={14} className="text-slate-500" title="Modalità Locale (Scollegato)" />}
+              <span className="text-[10px] text-slate-400 hidden md:inline uppercase">
+                {syncStatus === 'synced' ? 'Cloud' : syncStatus === 'syncing' ? 'Sync...' : syncStatus === 'error' ? 'Errore' : 'Locale'}
+              </span>
+            </div>
+
+            {/* Auth Button */}
+            {user ? (
+              <div className="flex items-center gap-2 bg-slate-800 border border-slate-700 p-1 rounded-lg">
+                <span className="text-[11px] text-slate-300 font-bold px-1.5 truncate max-w-[100px]">{user.email.split('@')[0]}</span>
+                <button 
+                  onClick={() => {
+                    if (auth) {
+                      auth.signOut().then(() => showToast("Disconnessione completata."));
+                    }
+                  }} 
+                  className="px-2 py-1 bg-red-900/60 hover:bg-red-800 text-red-100 rounded text-[10px] font-bold cursor-pointer transition-colors"
+                >
+                  Logout
+                </button>
+              </div>
+            ) : (
+              <button 
+                onClick={() => setIsAuthModalOpen(true)}
+                className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-xs font-bold flex items-center gap-1.5 transition-colors cursor-pointer"
+              >
+                <UploadCloud size={14} />
+                <span>Accedi Cloud</span>
+              </button>
+            )}
+
+            {/* API Key Settings Button */}
             <button onClick={openApiKeySettings} className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer">
               <Key size={14} className={apiKey ? "text-emerald-400" : "text-amber-400"} />
               <span className="hidden sm:inline">{apiKey ? "API Key Impostata" : "Imposta API Key"}</span>
