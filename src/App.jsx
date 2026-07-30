@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { 
   BookOpen, CheckCircle, Circle, Star, Wand2, Sparkles, 
   Book, Bookmark, Search, Layers, Trash2, Plus, Image as ImageIcon, 
@@ -10,7 +10,7 @@ import {
 const appId = typeof window !== 'undefined' && window.__app_id ? window.__app_id : 'libri-di-maurizio';
 
 // Incrementare a ogni modifica rilasciata (si parte da 2.0)
-const APP_VERSION = '2.3';
+const APP_VERSION = '2.4';
 
 const STATUSES = {
   ALL: { label: 'Tutti', value: 'ALL' },
@@ -469,6 +469,11 @@ export default function App() {
   const [isSyncing, setIsSyncing] = useState(false);
   // Avanzamento dell'importazione: { fatti, totale } oppure null
   const [importProgress, setImportProgress] = useState(null);
+  // Copia sempre aggiornata dei libri, leggibile dentro i callback di Firestore
+  const booksRef = useRef([]);
+  // Evita che una riconciliazione parta mentre un'altra e' in corso: ogni
+  // blocco scritto genera un nuovo snapshot, che la farebbe ripartire.
+  const riconciliazioneInCorso = useRef(false);
   const [starFilters, setStarFilters] = useState(() => {
     try {
       const saved = localStorage.getItem('libreria_star_filters');
@@ -549,24 +554,48 @@ export default function App() {
             cloudBooks.push(doc.data());
           });
 
-          setBooks((localBooks) => {
-            const merged = mergeBooksLists(localBooks, cloudBooks);
+          const localBooks = booksRef.current || [];
+          const merged = mergeBooksLists(localBooks, cloudBooks);
+          setBooks(merged);
+          try {
+            localStorage.setItem('myBooksData_cloud_cache', JSON.stringify(merged));
+          } catch (e) {}
 
-            // Reconcile: carica sul database eventuali modifiche fatte localmente
-            localBooks.forEach(lb => {
-              const cb = cloudBooks.find(c => c.id === lb.id);
-              if (!cb || new Date(lb.updatedAt || 0).getTime() > new Date(cb.updatedAt || 0).getTime()) {
-                db.collection('books').doc(lb.id).set({ ...lb, userId: user.uid })
-                  .catch(err => console.error("Errore reconcile book:", lb.id, err));
+          // Riconciliazione: individua i libri locali assenti dal cloud o piu'
+          // recenti. Confronto tramite Map: con migliaia di libri una find()
+          // annidata costerebbe milioni di scansioni.
+          const cloudMap = new Map(cloudBooks.map(b => [b.id, b]));
+          const daCaricare = localBooks
+            .filter(lb => {
+              const cb = cloudMap.get(lb.id);
+              return !cb || new Date(lb.updatedAt || 0).getTime() > new Date(cb.updatedAt || 0).getTime();
+            })
+            .map(lb => normalizeBook(lb, user.uid, { preservaData: true }));
+
+          if (daCaricare.length > 0 && !riconciliazioneInCorso.current) {
+            riconciliazioneInCorso.current = true;
+            setSyncStatus('syncing');
+            setImportProgress({ fatti: 0, totale: daCaricare.length });
+            caricaLibriInBlocchi(daCaricare, {
+              onProgresso: (fatti, totale) => setImportProgress({ fatti, totale })
+            }).then(({ salvati, falliti, primoErrore }) => {
+              setImportProgress(null);
+              if (falliti > 0) {
+                setSyncStatus('error');
+                showToast(
+                  `Sincronizzazione cloud fallita per ${falliti} libri (${primoErrore?.code || 'errore sconosciuto'}).`,
+                  "error"
+                );
+              } else {
+                setSyncStatus('synced');
+                if (salvati > 0) showToast(`Sincronizzati ${salvati} libri sul cloud.`);
               }
+            }).finally(() => {
+              riconciliazioneInCorso.current = false;
             });
-
-            try {
-              localStorage.setItem('myBooksData_cloud_cache', JSON.stringify(merged));
-            } catch (e) {}
-            return merged;
-          });
-          setSyncStatus('synced');
+          } else if (!riconciliazioneInCorso.current) {
+            setSyncStatus('synced');
+          }
           setIsSyncing(false);
         },
         (error) => {
@@ -615,6 +644,7 @@ export default function App() {
 
   // Backup in LocalStorage come cache
   useEffect(() => {
+    booksRef.current = books;
     try {
       localStorage.setItem('myBooksData_cloud_cache', JSON.stringify(books));
     } catch (e) {
@@ -678,6 +708,33 @@ export default function App() {
       currentPage: Number(bookData.currentPage) || 0,
       userId: uid
     };
+  };
+
+  // Carica una lista di libri su Firestore in blocchi.
+  // Unico punto di scrittura massiva: usarlo sia per l'importazione sia per la
+  // riconciliazione evita che le due si ostacolino a vicenda inondando la
+  // connessione di scritture singole simultanee.
+  const caricaLibriInBlocchi = async (libri, { onProgresso } = {}) => {
+    const DIMENSIONE_BLOCCO = 400;
+    let salvati = 0;
+    let falliti = 0;
+    let primoErrore = null;
+
+    for (let i = 0; i < libri.length; i += DIMENSIONE_BLOCCO) {
+      const blocco = libri.slice(i, i + DIMENSIONE_BLOCCO);
+      try {
+        const batch = db.batch();
+        blocco.forEach(b => batch.set(db.collection('books').doc(b.id), b));
+        await batch.commit();
+        salvati += blocco.length;
+      } catch (err) {
+        falliti += blocco.length;
+        if (!primoErrore) primoErrore = err;
+        console.error("Errore scrittura blocco Firestore:", err?.code, err?.message, err);
+      }
+      if (onProgresso) onProgresso(Math.min(i + DIMENSIONE_BLOCCO, libri.length), libri.length);
+    }
+    return { salvati, falliti, primoErrore };
   };
 
   const saveBookToCloud = async (bookData) => {
@@ -1548,36 +1605,26 @@ export default function App() {
         return;
       }
 
-      // Scrittura sul cloud in blocchi: Firestore accetta al massimo 500
-      // operazioni per batch.
-      const DIMENSIONE_BLOCCO = 400;
-      let salvati = 0;
-      let falliti = 0;
       setImportProgress({ fatti: 0, totale: libri.length });
       setSyncStatus('syncing');
-
-      for (let i = 0; i < libri.length; i += DIMENSIONE_BLOCCO) {
-        const blocco = libri.slice(i, i + DIMENSIONE_BLOCCO);
-        try {
-          const batch = db.batch();
-          blocco.forEach(b => batch.set(db.collection('books').doc(b.id), b));
-          await batch.commit();
-          salvati += blocco.length;
-        } catch (err) {
-          console.error("Errore importazione blocco:", err);
-          falliti += blocco.length;
-        }
-        setImportProgress({ fatti: Math.min(i + DIMENSIONE_BLOCCO, libri.length), totale: libri.length });
-      }
-
+      const { salvati, falliti, primoErrore } = await caricaLibriInBlocchi(libri, {
+        onProgresso: (fatti, totale) => setImportProgress({ fatti, totale })
+      });
       setImportProgress(null);
       setSyncStatus(falliti > 0 ? 'error' : 'synced');
-      showToast(
-        falliti > 0
-          ? `Importati ${salvati} libri. ${falliti} non salvati sul cloud: riprova l'importazione.`
-          : `Importati e sincronizzati ${salvati} libri.`,
-        falliti > 0 ? 'error' : 'success'
-      );
+
+      if (falliti > 0) {
+        // Mostrare il codice d'errore di Firestore: senza, l'utente non ha modo
+        // di distinguere un problema di permessi da uno di rete.
+        const codice = primoErrore?.code || 'sconosciuto';
+        const dettaglio = primoErrore?.message ? ` — ${primoErrore.message}` : '';
+        showToast(
+          `Importati ${salvati} libri su ${libri.length}. Errore cloud [${codice}]${dettaglio}`,
+          "error"
+        );
+      } else {
+        showToast(`Importati e sincronizzati ${salvati} libri.`);
+      }
     };
 
     const handleCsvImport = (e) => {
