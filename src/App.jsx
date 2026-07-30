@@ -10,7 +10,7 @@ import {
 const appId = typeof window !== 'undefined' && window.__app_id ? window.__app_id : 'libri-di-maurizio';
 
 // Incrementare a ogni modifica rilasciata (si parte da 2.0)
-const APP_VERSION = '3.2';
+const APP_VERSION = '3.3';
 
 const STATUSES = {
   ALL: { label: 'Tutti', value: 'ALL' },
@@ -690,6 +690,12 @@ export default function App() {
             if (data.giaLettiOrder) setGiaLettiOrder(data.giaLettiOrder);
             if (data.daLeggereOrder) setDaLeggereOrder(data.daLeggereOrder);
             if (data.libreriaOrder) setLibreriaOrder(data.libreriaOrder);
+            // Chiave Gemini salvata da un altro dispositivo: la si adotta qui
+            // senza doverla reinserire.
+            if (data.geminiApiKey && data.geminiApiKey !== localStorage.getItem('gemini_api_key')) {
+              setApiKey(data.geminiApiKey);
+              try { localStorage.setItem('gemini_api_key', data.geminiApiKey); } catch (e) {}
+            }
             // Cancellazioni fatte da un altro dispositivo: vanno applicate
             // anche qui, altrimenti questo device continuerebbe a mostrarle
             // e a ricaricarle sul cloud.
@@ -749,6 +755,20 @@ export default function App() {
     });
   };
 
+  // Toglie degli id dal registro delle cancellazioni: serve quando un libro
+  // viene reinserito o reimportato, altrimenti resterebbe filtrato via.
+  const annullaCancellazioni = (ids) => {
+    if (!ids || ids.length === 0) return;
+    const daTogliere = new Set(ids);
+    setDeletedIds(prev => {
+      if (!prev.some(id => daTogliere.has(id))) return prev;
+      const ripulito = prev.filter(id => !daTogliere.has(id));
+      deletedIdsRef.current = ripulito;
+      saveSettingsToCloud({ deletedIds: ripulito });
+      return ripulito;
+    });
+  };
+
   // Backup in LocalStorage come cache
   useEffect(() => {
     booksRef.current = books;
@@ -772,8 +792,17 @@ export default function App() {
     const trimmed = newKey.trim();
     setApiKey(trimmed);
     localStorage.setItem('gemini_api_key', trimmed);
+    // Salvata anche fra le impostazioni dell'account: finora viveva solo in
+    // questo browser, e su ogni altro dispositivo andava reinserita a mano.
+    // Finisce nel documento privato dell'utente, che le regole Firestore
+    // rendono leggibile solo a lui.
+    saveSettingsToCloud({ geminiApiKey: trimmed });
     setIsSettingsOpen(false);
-    showToast("Chiave API Gemini salvata!", "success");
+    showToast(
+      user ? "Chiave API salvata e disponibile su tutti i tuoi dispositivi."
+           : "Chiave API salvata su questo browser. Accedi al cloud per averla ovunque.",
+      "success"
+    );
   };
 
   const navigateTo = (tab) => {
@@ -889,6 +918,10 @@ export default function App() {
       });
     }
 
+    // Un libro salvato non e' piu' cancellato: senza toglierlo dal registro,
+    // reinserirlo (o reimportarlo dal backup) verrebbe soppresso in silenzio.
+    annullaCancellazioni([bookId]);
+
     // Aggiorna lo stato locale immediatamente
     setBooks(prev => {
       const exists = prev.some(b => b.id === bookId);
@@ -898,19 +931,35 @@ export default function App() {
       return [cleanBook, ...prev];
     });
 
-    // Salva su Firestore se connessi
+    // Salva su Firestore se connessi.
+    // Il timeout serve come per le scritture in blocco: se il client non
+    // raggiunge il database, set() non si risolve ne' fallisce mai, e lo
+    // stato resterebbe "in sincronizzazione" all'infinito senza dire nulla.
     if (db && user) {
       setSyncStatus('syncing');
-      db.collection('books').doc(bookId).set(cleanBook)
+      const scrittura = db.collection('books').doc(bookId).set(cleanBook);
+      Promise.race([
+        scrittura,
+        new Promise((_, rifiuta) => setTimeout(() => {
+          const e = new Error("Nessuna risposta dal database entro 20 secondi.");
+          e.code = 'timeout';
+          rifiuta(e);
+        }, 20000))
+      ])
         .then(() => setSyncStatus('synced'))
         .catch(err => {
-          console.error("Errore salvataggio Firestore:", err);
+          console.error("Errore salvataggio Firestore:", err?.code, err);
           setSyncStatus('error');
-          showToast("Salvataggio locale eseguito. Sync cloud fallito.", "error");
+          showToast(
+            `Modifica salvata qui, ma non sul cloud (${err?.code || 'errore'}). Verrà ritentata alla prossima sincronizzazione.`,
+            "error"
+          );
         });
     }
 
-    showToast("Libro salvato con successo nella tua libreria!");
+    // Conferma solo per i salvataggi espliciti: stelle, stato e flag passano
+    // di qui a ogni clic e riempirebbero lo schermo di messaggi.
+    if (portaInCima) showToast("Libro salvato nella tua libreria!");
   };
 
   // Unico punto di eliminazione, usato da scheda libro, eliminazione multipla
@@ -1942,6 +1991,10 @@ export default function App() {
         showToast("Nessun libro valido trovato nel file.", "error");
         return;
       }
+
+      // Reimportare significa volerli indietro: gli id vanno tolti dal
+      // registro delle cancellazioni, altrimenti verrebbero scartati.
+      annullaCancellazioni(libri.map(b => b.id));
 
       // Un solo aggiornamento di stato: con migliaia di libri, salvarli uno a
       // uno provocherebbe altrettanti render dell'intera lista e bloccherebbe
