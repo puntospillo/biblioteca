@@ -9,6 +9,9 @@ import {
 
 const appId = typeof window !== 'undefined' && window.__app_id ? window.__app_id : 'libri-di-maurizio';
 
+// Incrementare a ogni modifica rilasciata (si parte da 2.0)
+const APP_VERSION = '2.1';
+
 const STATUSES = {
   ALL: { label: 'Tutti', value: 'ALL' },
   TO_READ: { label: 'Da Leggere', value: 'TO_READ', color: 'bg-amber-100 text-amber-800 border-amber-200' },
@@ -464,10 +467,19 @@ export default function App() {
   });
 
   // Liste di ordinamento manuale persistenti
-  const [inLetturaOrder, setInLetturaOrder] = useState([]);
-  const [preferitiOrder, setPreferitiOrder] = useState([]);
-  const [giaLettiOrder, setGiaLettiOrder] = useState([]);
-  const [daLeggereOrder, setDaLeggereOrder] = useState([]);
+  // Init da localStorage: l'ordine sopravvive al refresh anche prima che arrivi il cloud
+  const loadOrder = (key) => {
+    try {
+      const saved = localStorage.getItem(`libreria_order_${key}`);
+      if (saved) return JSON.parse(saved);
+    } catch (e) {}
+    return [];
+  };
+  const [inLetturaOrder, setInLetturaOrder] = useState(() => loadOrder('inLettura'));
+  const [preferitiOrder, setPreferitiOrder] = useState(() => loadOrder('preferiti'));
+  const [giaLettiOrder, setGiaLettiOrder] = useState(() => loadOrder('giaLetti'));
+  const [daLeggereOrder, setDaLeggereOrder] = useState(() => loadOrder('daLeggere'));
+  const [libreriaOrder, setLibreriaOrder] = useState(() => loadOrder('libreria'));
   
   // Memorizzazione ultima ricerca ed esplorazione
   const [lastSearch, setLastSearch] = useState({
@@ -555,6 +567,7 @@ export default function App() {
             if (data.preferitiOrder) setPreferitiOrder(data.preferitiOrder);
             if (data.giaLettiOrder) setGiaLettiOrder(data.giaLettiOrder);
             if (data.daLeggereOrder) setDaLeggereOrder(data.daLeggereOrder);
+            if (data.libreriaOrder) setLibreriaOrder(data.libreriaOrder);
             if (data.starFilters) {
               setStarFilters(data.starFilters);
               localStorage.setItem('libreria_star_filters', JSON.stringify(data.starFilters));
@@ -684,19 +697,76 @@ export default function App() {
     showToast("Libro eliminato dalla libreria!");
   };
 
-  const moveBook = (id, direction) => {
-    // Spostamento manuale all'interno del catalogo completo
-    setBooks(prev => {
-      const index = prev.findIndex(b => b.id === id);
-      if (index === -1) return prev;
-      const targetIndex = direction === 'up' ? index - 1 : index + 1;
-      if (targetIndex < 0 || targetIndex >= prev.length) return prev;
-      const newBooks = [...prev];
-      const temp = newBooks[index];
-      newBooks[index] = newBooks[targetIndex];
-      newBooks[targetIndex] = temp;
-      return newBooks;
+  // --- Ordinamento manuale per sezione ---------------------------------
+  // Ogni sezione ha una lista di id. I libri elencati vengono prima, nell'ordine
+  // indicato; gli altri restano nell'ordine automatico (sort stabile).
+  const ORDER_SETTERS = {
+    inLettura: setInLetturaOrder,
+    preferiti: setPreferitiOrder,
+    giaLetti: setGiaLettiOrder,
+    daLeggere: setDaLeggereOrder,
+    libreria: setLibreriaOrder
+  };
+  const ORDER_FIELDS = {
+    inLettura: 'inLetturaOrder',
+    preferiti: 'preferitiOrder',
+    giaLetti: 'giaLettiOrder',
+    daLeggere: 'daLeggereOrder',
+    libreria: 'libreriaOrder'
+  };
+
+  const applyManualOrder = (list, orderIds) => {
+    if (!orderIds || orderIds.length === 0) return list;
+    const pos = new Map(orderIds.map((id, i) => [id, i]));
+    return [...list].sort((a, b) => {
+      const pa = pos.has(a.id) ? pos.get(a.id) : Number.MAX_SAFE_INTEGER;
+      const pb = pos.has(b.id) ? pos.get(b.id) : Number.MAX_SAFE_INTEGER;
+      return pa - pb;
     });
+  };
+
+  const persistSectionOrder = (sectionKey, ids) => {
+    const setter = ORDER_SETTERS[sectionKey];
+    if (setter) setter(ids);
+    try {
+      localStorage.setItem(`libreria_order_${sectionKey}`, JSON.stringify(ids));
+    } catch (e) {}
+    saveSettingsToCloud({ [ORDER_FIELDS[sectionKey]]: ids });
+  };
+
+  // Sposta un libro su/giù restando dentro il proprio gruppo.
+  // fullOrder permette a "Da leggere" di salvare entrambi i gruppi (senza flag
+  // + con flag "Da scaricare") mantenendo i secondi sempre in coda.
+  const moveInSection = (sectionKey, group, bookId, direction, fullOrder = null) => {
+    const index = group.findIndex(b => b.id === bookId);
+    if (index === -1) return;
+    const targetIndex = direction === 'up' ? index - 1 : index + 1;
+    if (targetIndex < 0 || targetIndex >= group.length) return;
+
+    const ids = group.map(b => b.id);
+    [ids[index], ids[targetIndex]] = [ids[targetIndex], ids[index]];
+
+    const newOrder = fullOrder
+      ? fullOrder.map(g => (g === group ? ids : g.map(b => b.id))).flat()
+      : ids;
+    persistSectionOrder(sectionKey, newOrder);
+  };
+
+  // Riordino via drag & drop dentro la stessa sezione: inserisce il libro
+  // trascinato prima di quello su cui viene rilasciato.
+  const reorderInSection = (sectionKey, group, draggedId, targetId, fullOrder = null) => {
+    if (draggedId === targetId) return;
+    const ids = group.map(b => b.id);
+    const from = ids.indexOf(draggedId);
+    const to = ids.indexOf(targetId);
+    if (from === -1 || to === -1) return;
+    ids.splice(from, 1);
+    ids.splice(to, 0, draggedId);
+
+    const newOrder = fullOrder
+      ? fullOrder.map(g => (g === group ? ids : g.map(b => b.id))).flat()
+      : ids;
+    persistSectionOrder(sectionKey, newOrder);
   };
 
   const handleAiCallWithCheck = async (prompt, systemInstruction = "", useSearch = false, expectJson = false) => {
@@ -724,39 +794,65 @@ export default function App() {
       ? (ratedReadBooks.reduce((sum, b) => sum + Number(b.rating), 0) / ratedReadBooks.length).toFixed(1) 
       : '0.0';
 
-    // Sezione 1: In Lettura - ordinati per updatedAt desc
-    const inLetturaBooks = books.filter(b => b.status === 'READING')
-      .sort((a, b) => new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0));
+    const byRecent = (a, b) => new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0);
 
-    // Sezione 2: Preferiti - 5 stelle poi 4 stelle, poi per updatedAt
-    const preferitiBooks = books.filter(b => (b.rating || 0) >= 4)
-      .sort((a, b) => {
+    // Sezione 1: In Lettura - per data di ultima modifica, poi ordine manuale
+    const inLetturaBooks = applyManualOrder(
+      books.filter(b => b.status === 'READING').sort(byRecent),
+      inLetturaOrder
+    );
+
+    // Sezione 2: Preferiti - 5 stelle, poi 4 stelle, poi updatedAt; infine ordine manuale
+    const preferitiBooks = applyManualOrder(
+      books.filter(b => (b.rating || 0) >= 4).sort((a, b) => {
         if ((b.rating || 0) !== (a.rating || 0)) return (b.rating || 0) - (a.rating || 0);
-        return new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0);
-      });
+        return byRecent(a, b);
+      }),
+      preferitiOrder
+    );
 
-    // Sezione 3: Già Letti - ordinati per updatedAt desc
-    const giaLettiBooks = readBooks
-      .sort((a, b) => new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0));
+    // Sezione 3: Già Letti - per data di ultima modifica, poi ordine manuale
+    const giaLettiBooks = applyManualOrder(readBooks.slice().sort(byRecent), giaLettiOrder);
 
-    // Sezione 4: Da Leggere - Gruppo 1 (senza daScaricare) poi Gruppo 2 (con daScaricare)
+    // Sezione 4: Da Leggere - due gruppi. I libri con flag "Da scaricare" restano
+    // nella sezione ma sempre in coda; l'ordine manuale vale dentro ogni gruppo.
     const daLeggereAll = books.filter(b => b.status === 'TO_READ');
-    const daLeggereG1 = daLeggereAll.filter(b => !b.daScaricare)
-      .sort((a, b) => new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0));
-    const daLeggereG2 = daLeggereAll.filter(b => !!b.daScaricare)
-      .sort((a, b) => new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0));
+    const daLeggereG1 = applyManualOrder(
+      daLeggereAll.filter(b => !b.daScaricare).sort(byRecent), daLeggereOrder
+    );
+    const daLeggereG2 = applyManualOrder(
+      daLeggereAll.filter(b => !!b.daScaricare).sort(byRecent), daLeggereOrder
+    );
+    const daLeggereGroups = [daLeggereG1, daLeggereG2];
     const daLeggereBooks = [...daLeggereG1, ...daLeggereG2];
 
-    // Drag & Drop
-    const handleDragStart = (e, bookId) => {
+    // Drag & Drop: si trascina fra sezioni (cambia stato) oppure sopra un altro
+    // libro della stessa sezione (riordino manuale).
+    const handleDragStart = (e, bookId, fromSection = '') => {
       e.dataTransfer.setData('text/plain', bookId);
+      e.dataTransfer.setData('application/x-sezione', fromSection);
       e.dataTransfer.effectAllowed = 'move';
+    };
+
+    const handleDropOnBook = (e, sectionKey, group, targetId, fullOrder = null) => {
+      const draggedId = e.dataTransfer.getData('text/plain');
+      const fromSection = e.dataTransfer.getData('application/x-sezione');
+      // Solo dentro la stessa sezione e lo stesso gruppo: altrimenti lascio
+      // gestire al drop sulla sezione, che cambia stato.
+      if (!draggedId || fromSection !== sectionKey) return false;
+      if (!group.some(b => b.id === draggedId)) return false;
+      e.preventDefault();
+      e.stopPropagation();
+      reorderInSection(sectionKey, group, draggedId, targetId, fullOrder);
+      return true;
     };
 
     const handleDropOnSection = (e, targetSection) => {
       e.preventDefault();
       const bookId = e.dataTransfer.getData('text/plain');
       if (!bookId) return;
+      // Riordino interno già gestito dal drop sulla riga
+      if (e.dataTransfer.getData('application/x-sezione') === targetSection) return;
       const targetBook = books.find(b => b.id === bookId);
       if (!targetBook) return;
       let updatedBook = { ...targetBook };
@@ -809,53 +905,74 @@ export default function App() {
       </button>
     );
 
-    // Reusable Book Row per le sezioni
-    const BookRow = ({ book, idx, list, sectionColor = 'blue' }) => (
-      <div 
-        draggable onDragStart={(e) => handleDragStart(e, book.id)}
-        onClick={() => openBookDetails(book)} 
-        className={`flex items-center gap-2 p-2 hover:bg-slate-50 rounded-lg cursor-grab active:cursor-grabbing transition-colors border border-slate-100 hover:border-slate-300 group ${book.daScaricare ? 'bg-emerald-50/30' : ''}`}
-      >
-        <div className="w-9 h-13 bg-slate-200 rounded overflow-hidden shrink-0 relative shadow-xs">
-          {book.coverUrl ? <img src={book.coverUrl} className="w-full h-full object-cover" alt="" /> : <Book className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 text-slate-400" size={14} />}
-        </div>
-        <div className="flex-1 overflow-hidden min-w-0">
-          <p className="text-xs font-bold text-slate-800 truncate group-hover:text-blue-600">{book.title}</p>
-          <p className="text-[10px] text-slate-500 truncate">{book.lastName} {book.firstName}</p>
-          <div className="flex items-center gap-1.5 mt-0.5 flex-wrap">
-            <InlineStars book={book} />
-            <InlineStatus book={book} />
-            <DaScaricareBadge book={book} />
+    // Riga libro riutilizzabile. group = gruppo di appartenenza (serve per i
+    // limiti dello spostamento su/giù e per il riordino via drag & drop).
+    const BookRow = ({ book, sectionKey, group, fullOrder = null, hero = false }) => {
+      const idx = group.findIndex(b => b.id === book.id);
+      return (
+        <div
+          draggable
+          onDragStart={(e) => handleDragStart(e, book.id, sectionKey)}
+          onDragOver={(e) => e.preventDefault()}
+          onDrop={(e) => handleDropOnBook(e, sectionKey, group, book.id, fullOrder)}
+          onClick={() => openBookDetails(book)}
+          className={`flex items-center gap-2 p-2 hover:bg-white/70 rounded-lg cursor-grab active:cursor-grabbing transition-colors border border-slate-100 hover:border-slate-300 group ${book.daScaricare ? 'bg-emerald-50/40' : 'bg-white/50'}`}
+        >
+          <div className={`${hero ? 'w-11 h-16' : 'w-9 h-13'} bg-slate-200 rounded overflow-hidden shrink-0 relative shadow-xs`}>
+            {book.coverUrl
+              ? <img src={book.coverUrl} className="w-full h-full object-cover" alt="" loading="lazy" />
+              : <Book className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 text-slate-400" size={14} />}
+          </div>
+          <div className="flex-1 overflow-hidden min-w-0">
+            <p className={`${hero ? 'text-sm' : 'text-xs'} font-bold text-slate-800 truncate group-hover:text-blue-600`}>{book.title}</p>
+            <p className="text-[10px] text-slate-500 truncate">{book.lastName} {book.firstName}</p>
+            <div className="flex items-center gap-1.5 mt-0.5 flex-wrap">
+              <InlineStars book={book} />
+              <InlineStatus book={book} />
+              <DaScaricareBadge book={book} />
+            </div>
+          </div>
+          <div className="flex flex-col gap-0.5 shrink-0">
+            <button title="Sposta su"
+              onClick={(e) => { e.stopPropagation(); moveInSection(sectionKey, group, book.id, 'up', fullOrder); }}
+              disabled={idx <= 0}
+              className="p-0.5 hover:bg-blue-100 rounded text-slate-500 hover:text-blue-700 disabled:opacity-20 cursor-pointer"><ChevronUp size={12} /></button>
+            <button title="Sposta giù"
+              onClick={(e) => { e.stopPropagation(); moveInSection(sectionKey, group, book.id, 'down', fullOrder); }}
+              disabled={idx === group.length - 1}
+              className="p-0.5 hover:bg-blue-100 rounded text-slate-500 hover:text-blue-700 disabled:opacity-20 cursor-pointer"><ChevronDown size={12} /></button>
           </div>
         </div>
-        <div className="flex flex-col gap-0.5 shrink-0">
-          <button onClick={(e) => { e.stopPropagation(); moveBook(book.id, 'up'); }} disabled={idx === 0}
-            className="p-0.5 hover:bg-blue-100 rounded text-slate-500 hover:text-blue-700 disabled:opacity-20 cursor-pointer"><ChevronUp size={12} /></button>
-          <button onClick={(e) => { e.stopPropagation(); moveBook(book.id, 'down'); }} disabled={idx === list.length - 1}
-            className="p-0.5 hover:bg-blue-100 rounded text-slate-500 hover:text-blue-700 disabled:opacity-20 cursor-pointer"><ChevronDown size={12} /></button>
-        </div>
-      </div>
-    );
+      );
+    };
 
-    // Sezione generica riutilizzabile
-    const DashSection = ({ title, icon: Icon, iconClass, badgeClass, books: sectionBooks, limitKey, dropTarget, emptyMsg, highlight = false }) => {
+    // Sezione generica riutilizzabile.
+    // groups: se la sezione ha più gruppi (Da Leggere), l'ordine manuale e lo
+    // spostamento restano confinati dentro ciascun gruppo.
+    const DashSection = ({ title, icon: Icon, iconClass, badgeClass, books: sectionBooks,
+                           limitKey, dropTarget, emptyMsg, hero = false, groups = null }) => {
       const visibleBooks = sectionBooks.slice(0, limits[limitKey]);
       const hasMore = sectionBooks.length > limits[limitKey];
+      const groupList = groups || [sectionBooks];
+      const groupOf = (b) => groupList.find(g => g.some(x => x.id === b.id)) || sectionBooks;
       return (
-        <Card 
-          onDragOver={(e) => e.preventDefault()} 
+        <Card
+          onDragOver={(e) => e.preventDefault()}
           onDrop={(e) => handleDropOnSection(e, dropTarget)}
-          className={`p-4 border-2 border-dashed border-transparent hover:border-slate-300 transition-colors ${highlight ? 'bg-gradient-to-br from-blue-50 to-indigo-50 border-blue-200 shadow-md' : ''}`}
+          className={`p-4 border-2 border-dashed border-transparent hover:border-slate-300 transition-colors ${hero ? 'bg-gradient-to-br from-blue-50 to-indigo-50 !border-blue-200 shadow-md' : ''}`}
         >
-          <div className="flex items-center justify-between mb-3 border-b pb-2">
-            <h3 className="font-bold text-slate-800 text-sm flex items-center gap-2">
-              <Icon className={iconClass} size={16} /> {title} ({sectionBooks.length})
+          <div className="flex items-center justify-between mb-3 border-b pb-2 gap-2">
+            <h3 className={`font-bold text-slate-800 ${hero ? 'text-base' : 'text-sm'} flex items-center gap-2 min-w-0`}>
+              <Icon className={`${iconClass} shrink-0`} size={hero ? 18 : 16} />
+              <span className="truncate">{title}</span>
+              <span className="text-slate-400 font-semibold shrink-0">({sectionBooks.length})</span>
             </h3>
-            <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${badgeClass}`}>Trascina qui</span>
+            <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full shrink-0 ${badgeClass}`}>Trascina qui</span>
           </div>
-          <div className="space-y-1.5 max-h-[600px] overflow-y-auto pr-1">
-            {visibleBooks.length > 0 ? visibleBooks.map((b, idx) => (
-              <BookRow key={b.id} book={b} idx={idx} list={visibleBooks} />
+          <div className={`space-y-1.5 ${hero ? 'max-h-[420px]' : 'max-h-[560px]'} overflow-y-auto pr-1`}>
+            {visibleBooks.length > 0 ? visibleBooks.map(b => (
+              <BookRow key={b.id} book={b} sectionKey={dropTarget} group={groupOf(b)}
+                fullOrder={groups} hero={hero} />
             )) : <p className="text-xs text-slate-400 italic py-6 text-center">{emptyMsg}</p>}
           </div>
           {hasMore && (
@@ -904,7 +1021,7 @@ export default function App() {
         </div>
 
         {/* Versione */}
-        <p className="text-[10px] text-slate-400 text-right font-mono">Release v2.0</p>
+        <p className="text-[10px] text-slate-400 text-right font-mono">Release v{APP_VERSION}</p>
 
         {/* AI Buttons */}
         <div className="flex flex-col sm:flex-row gap-4">
@@ -916,31 +1033,34 @@ export default function App() {
           </button>
         </div>
 
-        {/* 4 Sezioni Dashboard */}
-        <div className="space-y-6">
-          <DashSection 
-            title="📖 In Lettura" icon={BookOpen} iconClass="text-blue-600" 
-            badgeClass="bg-blue-100 text-blue-800" books={inLetturaBooks} 
-            limitKey="inLettura" dropTarget="inLettura" highlight={true}
-            emptyMsg="Nessun libro in lettura. Trascina un libro qui per iniziare!" 
-          />
-          <DashSection 
-            title="⭐ I tuoi Preferiti (4-5 ★)" icon={Star} iconClass="text-yellow-500 fill-yellow-500" 
-            badgeClass="bg-yellow-100 text-yellow-800" books={preferitiBooks} 
+        {/* Sezione 1: In Lettura - a tutta larghezza e in evidenza */}
+        <DashSection
+          title="📖 In Lettura" icon={BookOpen} iconClass="text-blue-600"
+          badgeClass="bg-blue-100 text-blue-800" books={inLetturaBooks}
+          limitKey="inLettura" dropTarget="inLettura" hero={true}
+          emptyMsg="Nessun libro in lettura. Trascina un libro qui per iniziare!"
+        />
+
+        {/* Sezioni 2-4 affiancate */}
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-6 items-start">
+          <DashSection
+            title="⭐ I tuoi Preferiti" icon={Star} iconClass="text-yellow-500 fill-yellow-500"
+            badgeClass="bg-yellow-100 text-yellow-800" books={preferitiBooks}
             limitKey="preferiti" dropTarget="preferiti"
-            emptyMsg="Nessun libro preferito. Assegna 4 o 5 stelle a un libro!" 
+            emptyMsg="Nessun libro preferito. Assegna 4 o 5 stelle a un libro!"
           />
-          <DashSection 
-            title="✓ Già Letti" icon={CheckCircle} iconClass="text-emerald-500" 
-            badgeClass="bg-emerald-100 text-emerald-800" books={giaLettiBooks} 
+          <DashSection
+            title="✓ Già Letti" icon={CheckCircle} iconClass="text-emerald-500"
+            badgeClass="bg-emerald-100 text-emerald-800" books={giaLettiBooks}
             limitKey="giaLetti" dropTarget="giaLetti"
-            emptyMsg="Nessun libro letto. Trascina un libro qui!" 
+            emptyMsg="Nessun libro letto. Trascina un libro qui!"
           />
-          <DashSection 
-            title="📚 Da Leggere" icon={Circle} iconClass="text-amber-500" 
-            badgeClass="bg-amber-100 text-amber-800" books={daLeggereBooks} 
+          <DashSection
+            title="📚 Da Leggere" icon={Circle} iconClass="text-amber-500"
+            badgeClass="bg-amber-100 text-amber-800" books={daLeggereBooks}
+            groups={daLeggereGroups}
             limitKey="daLeggere" dropTarget="daLeggere"
-            emptyMsg="Nessun libro da leggere. Aggiungi libri dalla libreria!" 
+            emptyMsg="Nessun libro da leggere. Aggiungi libri dalla libreria!"
           />
         </div>
       </div>
@@ -966,6 +1086,8 @@ export default function App() {
       const matchStatus = statusFilter === 'ALL' || b.status === statusFilter || (statusFilter === 'STELLE' && (b.rating || 0) > 0);
       return matchSearch && matchStatus;
     });
+    // L'ordine manuale della libreria ha priorità e viene sincronizzato
+    const ordered = applyManualOrder(filtered, libreriaOrder);
 
     const toggleSelect = (id) => setSelectedIds(prev => prev.includes(id) ? prev.filter(i => i !== id) : [...prev, id]);
     const selectAll = () => setSelectedIds(filtered.map(b => b.id));
@@ -1063,7 +1185,7 @@ export default function App() {
         </div>
 
         <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-4 mt-4">
-          {filtered.map((b, idx) => {
+          {ordered.map((b, idx) => {
             const isReading = b.status === 'READING';
             return (
               <div 
@@ -1085,7 +1207,7 @@ export default function App() {
                 <div className="absolute top-2 right-2 z-10 flex flex-col gap-1 opacity-90 group-hover:opacity-100 transition-opacity bg-white/90 backdrop-blur-sm p-0.5 rounded-lg shadow-sm border border-slate-200">
                   <button 
                     title="Sposta Su nella lista" 
-                    onClick={(e) => { e.stopPropagation(); moveBook(b.id, 'up'); }}
+                    onClick={(e) => { e.stopPropagation(); moveInSection('libreria', ordered, b.id, 'up'); }}
                     disabled={idx === 0}
                     className="p-1 hover:bg-blue-100 text-slate-700 hover:text-blue-700 disabled:opacity-30 rounded transition-colors cursor-pointer"
                   >
@@ -1093,8 +1215,8 @@ export default function App() {
                   </button>
                   <button 
                     title="Sposta Giù nella lista" 
-                    onClick={(e) => { e.stopPropagation(); moveBook(b.id, 'down'); }}
-                    disabled={idx === filtered.length - 1}
+                    onClick={(e) => { e.stopPropagation(); moveInSection('libreria', ordered, b.id, 'down'); }}
+                    disabled={idx === ordered.length - 1}
                     className="p-1 hover:bg-blue-100 text-slate-700 hover:text-blue-700 disabled:opacity-30 rounded transition-colors cursor-pointer"
                   >
                     <ChevronDown size={14} />
