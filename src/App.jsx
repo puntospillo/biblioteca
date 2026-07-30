@@ -10,7 +10,7 @@ import {
 const appId = typeof window !== 'undefined' && window.__app_id ? window.__app_id : 'libri-di-maurizio';
 
 // Incrementare a ogni modifica rilasciata (si parte da 2.0)
-const APP_VERSION = '2.1';
+const APP_VERSION = '2.2';
 
 const STATUSES = {
   ALL: { label: 'Tutti', value: 'ALL' },
@@ -34,14 +34,17 @@ const getFirebaseConfig = () => {
   } catch (e) {
     console.error("Errore lettura firebase_config da localStorage:", e);
   }
-  // Fallback default config per Maurizio
+  // Progetto Firebase reale (biblioteca-maurizio).
+  // Nota: questi valori sono pubblici per definizione — la config web di Firebase
+  // viaggia nel bundle JS di qualsiasi sito che la usa. I dati sono protetti dalle
+  // regole Firestore, che legano ogni libro allo userId di chi lo ha creato.
   return {
-    apiKey: "AIzaSyA4Q_DEMO_SANDBOX_KEY_MAURIZIO",
-    authDomain: "libri-di-maurizio-sandbox.firebaseapp.com",
-    projectId: "libri-di-maurizio-sandbox",
-    storageBucket: "libri-di-maurizio-sandbox.appspot.com",
-    messagingSenderId: "123456789012",
-    appId: "1:123456789012:web:demo123456789"
+    apiKey: "AIzaSyBHN9hyw9KEs-9C4lbzlq09xlPMPjpteN8",
+    authDomain: "biblioteca-maurizio.firebaseapp.com",
+    projectId: "biblioteca-maurizio",
+    storageBucket: "biblioteca-maurizio.firebasestorage.app",
+    messagingSenderId: "1032218389078",
+    appId: "1:1032218389078:web:e5a2a4eed8705785f169f7"
   };
 };
 
@@ -59,11 +62,25 @@ if (typeof window !== 'undefined') {
       }
       authInstance = window.firebase.auth();
       firestoreInstance = window.firebase.firestore();
-      
-      // Abilita persistenza offline (cache locale Firestore)
-      firestoreInstance.enablePersistence().catch((err) => {
-        console.warn("Persistenza offline Firestore non disponibile:", err.code);
-      });
+
+      // Persistenza offline (cache locale Firestore): con una libreria di
+      // migliaia di libri e' cio' che evita di rileggere tutto dalla rete a
+      // ogni apertura. Va abilitata una sola volta e prima di qualsiasi altra
+      // operazione, altrimenti Firestore lancia "failed-precondition":
+      // riesecuzioni del modulo (hot reload) la ritenterebbero a sproposito.
+      if (!window.__persistenzaFirestore) {
+        window.__persistenzaFirestore = true;
+        try {
+          firestoreInstance.enablePersistence({ synchronizeTabs: true })
+            .catch((err) => {
+              // failed-precondition: gia' aperta in un'altra scheda
+              // unimplemented: browser che non la supporta (es. Safari privato)
+              console.warn("Persistenza offline non attiva:", err.code);
+            });
+        } catch (e) {
+          console.warn("Persistenza offline non attivabile:", e.code || e.message);
+        }
+      }
     } catch (e) {
       console.error("Errore inizializzazione Firebase:", e);
     }
