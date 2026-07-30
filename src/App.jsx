@@ -10,7 +10,7 @@ import {
 const appId = typeof window !== 'undefined' && window.__app_id ? window.__app_id : 'libri-di-maurizio';
 
 // Incrementare a ogni modifica rilasciata (si parte da 2.0)
-const APP_VERSION = '2.4';
+const APP_VERSION = '2.5';
 
 const STATUSES = {
   ALL: { label: 'Tutti', value: 'ALL' },
@@ -63,15 +63,22 @@ if (typeof window !== 'undefined') {
       authInstance = window.firebase.auth();
       firestoreInstance = window.firebase.firestore();
 
-      // Persistenza offline (cache locale Firestore): con una libreria di
-      // migliaia di libri e' cio' che evita di rileggere tutto dalla rete a
-      // ogni apertura. Va abilitata una sola volta e prima di qualsiasi altra
-      // operazione, altrimenti Firestore lancia "failed-precondition":
-      // riesecuzioni del modulo (hot reload) la ritenterebbero a sproposito.
+      // Persistenza offline (cache locale Firestore).
+      //
+      // NON usare synchronizeTabs: con la persistenza multi-scheda una sola
+      // scheda ottiene il "primary lease" e solo quella parla col server. Se
+      // l'elezione non riesce — succede su Safari, dove IndexedDB e' limitato
+      // dalle protezioni antitracciamento, o quando resta il lease di una
+      // scheda chiusa male — le scritture finiscono in coda locale e
+      // batch.commit() non si risolve mai: nessun errore, attesa infinita.
+      // La cache a scheda singola da' comunque il beneficio che ci serve.
+      //
+      // Va inoltre abilitata una sola volta e prima di ogni altra operazione,
+      // altrimenti Firestore lancia "failed-precondition".
       if (!window.__persistenzaFirestore) {
         window.__persistenzaFirestore = true;
         try {
-          firestoreInstance.enablePersistence({ synchronizeTabs: true })
+          firestoreInstance.enablePersistence()
             .catch((err) => {
               // failed-precondition: gia' aperta in un'altra scheda
               // unimplemented: browser che non la supporta (es. Safari privato)
@@ -715,22 +722,42 @@ export default function App() {
   // riconciliazione evita che le due si ostacolino a vicenda inondando la
   // connessione di scritture singole simultanee.
   const caricaLibriInBlocchi = async (libri, { onProgresso } = {}) => {
-    const DIMENSIONE_BLOCCO = 400;
+    const DIMENSIONE_BLOCCO = 200;
+    const TIMEOUT_MS = 30000;
     let salvati = 0;
     let falliti = 0;
     let primoErrore = null;
+
+    // batch.commit() si risolve solo quando il server conferma la scrittura:
+    // se il client non raggiunge Firestore resta appeso per sempre, senza mai
+    // rifiutare. Il timeout trasforma quel blocco silenzioso in un errore
+    // leggibile invece che in una barra di avanzamento ferma a zero.
+    const conTimeout = (promessa) => Promise.race([
+      promessa,
+      new Promise((_, rifiuta) => setTimeout(() => {
+        const e = new Error("Nessuna risposta dal database entro 30 secondi. Verifica la connessione o eventuali blocchi del browser.");
+        e.code = 'timeout';
+        rifiuta(e);
+      }, TIMEOUT_MS))
+    ]);
 
     for (let i = 0; i < libri.length; i += DIMENSIONE_BLOCCO) {
       const blocco = libri.slice(i, i + DIMENSIONE_BLOCCO);
       try {
         const batch = db.batch();
         blocco.forEach(b => batch.set(db.collection('books').doc(b.id), b));
-        await batch.commit();
+        await conTimeout(batch.commit());
         salvati += blocco.length;
       } catch (err) {
         falliti += blocco.length;
         if (!primoErrore) primoErrore = err;
         console.error("Errore scrittura blocco Firestore:", err?.code, err?.message, err);
+        // Un timeout o un permesso negato valgono per tutti i blocchi:
+        // insistere significherebbe solo far attendere l'utente altri minuti.
+        if (err?.code === 'timeout' || err?.code === 'permission-denied') {
+          falliti = libri.length - salvati;
+          break;
+        }
       }
       if (onProgresso) onProgresso(Math.min(i + DIMENSIONE_BLOCCO, libri.length), libri.length);
     }
