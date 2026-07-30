@@ -10,7 +10,7 @@ import {
 const appId = typeof window !== 'undefined' && window.__app_id ? window.__app_id : 'libri-di-maurizio';
 
 // Incrementare a ogni modifica rilasciata (si parte da 2.0)
-const APP_VERSION = '2.2';
+const APP_VERSION = '2.3';
 
 const STATUSES = {
   ALL: { label: 'Tutti', value: 'ALL' },
@@ -467,6 +467,8 @@ export default function App() {
   // Sincronizzazione e stati avanzati
   const [syncStatus, setSyncStatus] = useState('offline'); // 'offline', 'syncing', 'synced', 'error'
   const [isSyncing, setIsSyncing] = useState(false);
+  // Avanzamento dell'importazione: { fatti, totale } oppure null
+  const [importProgress, setImportProgress] = useState(null);
   const [starFilters, setStarFilters] = useState(() => {
     try {
       const saved = localStorage.getItem('libreria_star_filters');
@@ -648,10 +650,13 @@ export default function App() {
     setActiveTab('scheda_libro');
   };
 
-  const saveBookToCloud = async (bookData) => {
-    if (!bookData) return;
+  // Normalizza un libro nella forma salvata su Firestore.
+  // preservaData serve all'importazione: riscrivere updatedAt con "adesso" su
+  // tutti i libri appiattirebbe le date e distruggerebbe l'ordinamento per
+  // ultima modifica su cui si basano le sezioni della dashboard.
+  const normalizeBook = (bookData, uid, { preservaData = false } = {}) => {
     const bookId = bookData.id || generateUniqueId();
-    const cleanBook = {
+    return {
       id: bookId,
       title: (bookData.title || 'Senza Titolo').trim(),
       firstName: (bookData.firstName || '').trim(),
@@ -665,14 +670,20 @@ export default function App() {
       notes: (bookData.notes || '').trim(),
       comments: (bookData.comments || '').trim(),
       addedAt: bookData.addedAt || new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
+      updatedAt: (preservaData && bookData.updatedAt) ? bookData.updatedAt : new Date().toISOString(),
       startReadDate: bookData.startReadDate || '',
       endReadDate: bookData.endReadDate || '',
       readingProgress: bookData.readingProgress || '',
       readingPercentage: Number(bookData.readingPercentage) || 0,
       currentPage: Number(bookData.currentPage) || 0,
-      userId: user ? user.uid : 'local-user'
+      userId: uid
     };
+  };
+
+  const saveBookToCloud = async (bookData) => {
+    if (!bookData) return;
+    const cleanBook = normalizeBook(bookData, user ? user.uid : 'local-user');
+    const bookId = cleanBook.id;
 
     // Aggiorna lo stato locale immediatamente
     setBooks(prev => {
@@ -1489,27 +1500,84 @@ export default function App() {
 
     const handleImportBackup = async (e) => {
       const file = e.target.files[0];
-      if(!file) return;
-      const reader = new FileReader();
-      reader.onload = async (ev) => {
-        try {
-          const importedData = JSON.parse(ev.target.result);
-          if (Array.isArray(importedData)) {
-            let count = 0;
-            for (const b of importedData) {
-              await saveBookToCloud(b);
-              count++;
-            }
-            showToast(`Importati correttamente ${count} libri.`);
-          } else {
-            showToast('Il file JSON non contiene un formato valido.', 'error');
-          }
-        } catch (error) {
-          showToast('File corrotto o non leggibile.', 'error');
-        }
-      };
-      reader.readAsText(file);
       e.target.value = '';
+      if (!file) return;
+
+      let testo;
+      try {
+        testo = await file.text();
+      } catch (err) {
+        showToast("Impossibile leggere il file selezionato.", "error");
+        return;
+      }
+
+      let dati;
+      try {
+        dati = JSON.parse(testo);
+      } catch (err) {
+        showToast("Il file non e' un JSON valido.", "error");
+        return;
+      }
+
+      // Accetta sia l'elenco diretto sia un oggetto che lo contiene
+      const lista = Array.isArray(dati)
+        ? dati
+        : (Array.isArray(dati?.books) ? dati.books : null);
+      if (!lista) {
+        showToast("Formato non riconosciuto: atteso un elenco di libri.", "error");
+        return;
+      }
+
+      const uid = user ? user.uid : 'local-user';
+      const libri = lista
+        .filter(b => b && typeof b === 'object' && (b.title || b.id))
+        .map(b => normalizeBook(b, uid, { preservaData: true }));
+
+      if (libri.length === 0) {
+        showToast("Nessun libro valido trovato nel file.", "error");
+        return;
+      }
+
+      // Un solo aggiornamento di stato: con migliaia di libri, salvarli uno a
+      // uno provocherebbe altrettanti render dell'intera lista e bloccherebbe
+      // il browser.
+      setBooks(prev => mergeBooksLists(prev, libri));
+
+      if (!db || !user) {
+        showToast(`Importati ${libri.length} libri in locale. Accedi al cloud per sincronizzarli.`, "info");
+        return;
+      }
+
+      // Scrittura sul cloud in blocchi: Firestore accetta al massimo 500
+      // operazioni per batch.
+      const DIMENSIONE_BLOCCO = 400;
+      let salvati = 0;
+      let falliti = 0;
+      setImportProgress({ fatti: 0, totale: libri.length });
+      setSyncStatus('syncing');
+
+      for (let i = 0; i < libri.length; i += DIMENSIONE_BLOCCO) {
+        const blocco = libri.slice(i, i + DIMENSIONE_BLOCCO);
+        try {
+          const batch = db.batch();
+          blocco.forEach(b => batch.set(db.collection('books').doc(b.id), b));
+          await batch.commit();
+          salvati += blocco.length;
+        } catch (err) {
+          console.error("Errore importazione blocco:", err);
+          falliti += blocco.length;
+        }
+        setImportProgress({ fatti: Math.min(i + DIMENSIONE_BLOCCO, libri.length), totale: libri.length });
+      }
+
+      setImportProgress(null);
+      setSyncStatus(falliti > 0 ? 'error' : 'synced');
+      showToast(
+        falliti > 0
+          ? `Importati ${salvati} libri. ${falliti} non salvati sul cloud: riprova l'importazione.`
+          : `Importati e sincronizzati ${salvati} libri.`,
+        falliti > 0 ? 'error' : 'success'
+      );
     };
 
     const handleCsvImport = (e) => {
@@ -1556,8 +1624,25 @@ export default function App() {
              <span className="bg-indigo-600 hover:bg-indigo-700 text-white px-6 py-3 rounded-xl font-bold text-xs cursor-pointer flex items-center justify-center shadow-sm">
                 <Upload size={16} className="mr-2" /> Carica File Backup JSON
              </span>
-             <input type="file" accept=".json" onChange={handleImportBackup} style={{ display: 'none' }}/>
+             <input type="file" accept=".json" onChange={handleImportBackup} style={{ display: 'none' }}
+               disabled={!!importProgress} />
           </label>
+
+          {importProgress && (
+            <div className="mt-4 bg-indigo-50 border border-indigo-200 rounded-xl p-4">
+              <div className="flex items-center justify-between text-xs font-bold text-indigo-900 mb-2">
+                <span className="flex items-center gap-2">
+                  <Loader2 size={14} className="animate-spin" />
+                  Importazione in corso — non chiudere questa pagina
+                </span>
+                <span>{importProgress.fatti} / {importProgress.totale}</span>
+              </div>
+              <div className="w-full h-2 bg-indigo-100 rounded-full overflow-hidden">
+                <div className="h-full bg-indigo-600 transition-all duration-300"
+                  style={{ width: `${Math.round((importProgress.fatti / importProgress.totale) * 100)}%` }} />
+              </div>
+            </div>
+          )}
         </div>
         <div>
           <h2 className="text-xl font-bold border-b border-slate-100 pb-3 mb-3 text-slate-900">3. Importa da File CSV</h2>
