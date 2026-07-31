@@ -21,10 +21,12 @@ Impagina il testo in Markdown perché sia leggibile:
 - "- " per gli elenchi puntati;
 - una riga vuota fra i paragrafi, che devono restare brevi (3-5 righe).
 Non usare tabelle, non usare emoji, non aprire con formule come "Certo!" o "Ecco".
-Entra subito nel merito.`;
+Entra subito nel merito.
+Nessuna parola inglese: usa sempre il termine italiano corrispondente. I titoli
+originali stranieri vanno riportati con il titolo italiano dell'edizione, se esiste.`;
 
 // Incrementare a ogni modifica rilasciata (si parte da 2.0)
-const APP_VERSION = '3.9';
+const APP_VERSION = '4.0';
 
 const STATUSES = {
   ALL: { label: 'Tutti', value: 'ALL' },
@@ -581,6 +583,41 @@ export default function App() {
   const [isSyncing, setIsSyncing] = useState(false);
   // Avanzamento dell'importazione: { fatti, totale } oppure null
   const [importProgress, setImportProgress] = useState(null);
+
+  // Modulo della scheda libro.
+  // Vive qui e non dentro SchedaLibro perche' le viste sono definite dentro
+  // App: a ogni aggiornamento di App vengono ricreate, React le considera
+  // componenti diversi e le rimonta azzerandone lo stato interno. Cosi' la
+  // trama e la copertina appena trovate sparivano subito dopo, perche' il
+  // messaggio di conferma provocava proprio quell'aggiornamento.
+  const FORM_VUOTO = {
+    id: '', title: '', firstName: '', lastName: '', coverUrl: '',
+    status: 'TO_READ', rating: 0, isNextRead: false, description: '', notes: ''
+  };
+  const [form, setForm] = useState(FORM_VUOTO);
+  const [isDraggingCover, setIsDraggingCover] = useState(false);
+  const schedaCaricataPer = useRef(null);
+
+  useEffect(() => {
+    if (activeTab !== 'scheda_libro') { schedaCaricataPer.current = null; return; }
+    const chiave = selectedBook?.id || '__nuovo__';
+    // Si ricarica solo al cambio di libro: un aggiornamento qualsiasi non deve
+    // sovrascrivere cio' che si sta scrivendo.
+    if (schedaCaricataPer.current === chiave) return;
+    schedaCaricataPer.current = chiave;
+    setForm(selectedBook ? {
+      id: selectedBook.id || '',
+      title: selectedBook.title || '',
+      firstName: selectedBook.firstName || '',
+      lastName: selectedBook.lastName || '',
+      coverUrl: selectedBook.coverUrl || '',
+      status: selectedBook.status || 'TO_READ',
+      rating: Number(selectedBook.rating) || 0,
+      isNextRead: !!selectedBook.isNextRead,
+      description: selectedBook.description || '',
+      notes: selectedBook.notes || ''
+    } : { ...FORM_VUOTO });
+  }, [activeTab, selectedBook]);
   // Registro delle cancellazioni ("lapidi").
   // Senza, la sincronizzazione non puo' distinguere un libro cancellato da uno
   // non ancora caricato: un dispositivo che lo ha ancora in cache lo vede
@@ -1458,35 +1495,52 @@ export default function App() {
 
     // AI Handlers
     const handleConsiglioBibliotecario = async () => {
-      setAiModal({ isOpen: true, title: 'Il Consiglio del Bibliotecario AI', content: '', loading: true });
-      // Si passano i piu' votati, non i primi qualsiasi: sono quelli che
-      // descrivono davvero i gusti del lettore.
-      const preferiti = readBooks.slice()
-        .sort((a, b) => (b.rating || 0) - (a.rating || 0))
-        .slice(0, 12)
-        .map(b => `${b.title} di ${b.lastName}${b.rating ? ` (${b.rating}/5)` : ''}`)
+      setAiModal({ isOpen: true, title: 'Il Consiglio del Bibliotecario', content: '', loading: true });
+
+      // Gusti: solo i libri letti da 4 stelle in su, dal piu' recente.
+      // Sono quelli che dicono davvero cosa gli piace adesso.
+      const graditi = readBooks
+        .filter(b => (b.rating || 0) >= 4)
+        .sort((a, b) => (b.rating || 0) - (a.rating || 0)
+          || new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0))
+        .slice(0, 15)
+        .map(b => `"${b.title}" di ${b.lastName} (${b.rating}/5)`)
         .join('; ');
-      const prompt = `Ecco i libri che ho letto e come li ho votati: ${preferiti || 'romanzi classici e moderni'}.
 
-Consigliami tre libri che non sono in questo elenco.
-Per ciascuno usa questa struttura:
-
-## Titolo del libro
-**Autore** — anno di pubblicazione
-Due o tre righe sul libro.
-Una riga che spieghi perché si adatta ai miei gusti, richiamando un titolo preciso fra quelli che ho letto.
-
-Chiudi con una breve sezione "## In sintesi" di due righe.`;
+      // Novita' reali dalle classifiche italiane, cosi' i consigli riguardano
+      // libri usciti davvero e non quelli che il modello ricorda a memoria.
+      let novita = '';
       try {
-        const risposta = await handleAiCallWithCheck(prompt, PROMPT_EDITORE, true);
-        setAiModal({ isOpen: true, title: 'Il Consiglio del Bibliotecario AI', content: risposta, loading: false });
+        const elenco = await fetchNovitaItalia(40);
+        novita = elenco
+          .map(x => `"${x.volumeInfo.title}" di ${x.volumeInfo.authors?.[0]} (${String(x.volumeInfo.publishedDate).slice(0,4)})`)
+          .join('; ');
+      } catch (e) { console.warn('Novità non disponibili per i consigli:', e); }
+
+      const prompt = `Libri che ho letto e apprezzato, dal voto più alto: ${graditi || 'nessuno ancora valutato'}.
+
+${novita ? `Uscite recenti disponibili in Italia fra cui scegliere:\n${novita}\n` : ''}
+Consigliami 5 libri. ${novita ? 'Scegli preferibilmente fra le uscite recenti elencate sopra.' : ''}
+Non propormi titoli che ho già letto.
+
+Per ciascuno usa ESATTAMENTE questo schema, senza aggiungere altro:
+
+## 1. Titolo
+**Autore** · anno
+**Trama:** due righe, non di più.
+**Perché a te:** una riga sola, che cita fra virgolette uno dei miei libri qui sopra.
+
+Niente introduzione, niente conclusione, niente commenti fuori dallo schema.`;
+      try {
+        const risposta = await handleAiCallWithCheck(prompt, PROMPT_EDITORE, false);
+        setAiModal({ isOpen: true, title: 'Il Consiglio del Bibliotecario', content: risposta, loading: false });
       } catch (e) {
         setAiModal({ isOpen: true, title: 'Assistente AI', content: e.message || 'Impossibile contattare l\'assistente AI.', loading: false });
       }
     };
 
     const handleProfiloLettore = async () => {
-      setAiModal({ isOpen: true, title: 'Identikit del Lettore AI', content: '', loading: true });
+      setAiModal({ isOpen: true, title: 'Il Tuo Profilo di Lettore', content: '', loading: true });
       // Con migliaia di libri l'elenco integrale supererebbe i limiti della
       // richiesta: si inviano i piu' votati e qualche dato d'insieme.
       const campione = readBooks.slice()
@@ -1498,24 +1552,31 @@ Chiudi con una breve sezione "## In sintesi" di due righe.`;
       const prompt = `Questi sono i miei libri più apprezzati fra i ${readBooks.length} che ho letto: ${campione || 'nessun libro ancora'}.
 ${inLettura ? `In questo momento sto leggendo: ${inLettura}.` : ''}
 
-Scrivi il mio identikit di lettore con questa struttura:
+Scrivi il mio profilo di lettore. Voglio solo il risultato, non il ragionamento
+che ti ha portato a formularlo: niente frasi come "dall'elenco emerge" o
+"analizzando le tue letture".
 
-## L'archetipo
-Un nome evocativo fra virgolette e due righe che lo spieghino.
+Usa ESATTAMENTE questo schema, senza aggiungere altro:
 
-## Cosa cerchi in un libro
-Tre punti elenco, ciascuno con un esempio preso dalle mie letture.
+## Sei "nome dell'archetipo"
+Una riga sola che lo spieghi.
 
-## Le tue ossessioni
-Temi o autori ricorrenti che emergono dall'elenco.
+## Generi
+Tre o quattro generi, separati da virgola. Nient'altro.
 
-## Il tuo punto cieco
-Un genere o un tipo di lettura che ti manca, con un consiglio per colmarlo.
+## Autori di riferimento
+Tre nomi presi dalle mie letture, separati da virgola.
 
-Tono acuto e affettuoso, mai adulatorio. Basati solo su ciò che vedi nell'elenco.`;
+## Cosa cerchi
+Tre punti elenco di una riga ciascuno.
+
+## Ti manca
+Una riga: un genere che non leggi, e un titolo preciso da cui partire.
+
+Niente introduzione, niente conclusione, niente commenti fuori dallo schema.`;
       try {
         const risposta = await handleAiCallWithCheck(prompt, PROMPT_EDITORE, false);
-        setAiModal({ isOpen: true, title: 'Il Tuo Identikit Letterario AI', content: risposta, loading: false });
+        setAiModal({ isOpen: true, title: 'Il Tuo Profilo di Lettore', content: risposta, loading: false });
       } catch (e) {
         setAiModal({ isOpen: true, title: 'Assistente AI', content: e.message || 'Impossibile generare l\'identikit.', loading: false });
       }
@@ -2264,38 +2325,8 @@ Tono acuto e affettuoso, mai adulatorio. Basati solo su ciò che vedi nell'elenc
 
   // 6. Scheda Libro (Book Details & Editing View - Complete Repair)
   const SchedaLibro = () => {
-    const [isDraggingCover, setIsDraggingCover] = useState(false);
-
-    const [form, setForm] = useState(() => ({
-      id: selectedBook?.id || '',
-      title: selectedBook?.title || '',
-      firstName: selectedBook?.firstName || '',
-      lastName: selectedBook?.lastName || '',
-      coverUrl: selectedBook?.coverUrl || '',
-      status: selectedBook?.status || 'TO_READ',
-      rating: Number(selectedBook?.rating) || 0,
-      isNextRead: !!selectedBook?.isNextRead,
-      description: selectedBook?.description || '',
-      notes: selectedBook?.notes || ''
-    }));
-
-    useEffect(() => {
-      if (selectedBook) {
-        setForm({
-          id: selectedBook.id || '',
-          title: selectedBook.title || '',
-          firstName: selectedBook.firstName || '',
-          lastName: selectedBook.lastName || '',
-          coverUrl: selectedBook.coverUrl || '',
-          status: selectedBook.status || 'TO_READ',
-          rating: Number(selectedBook.rating) || 0,
-          isNextRead: !!selectedBook.isNextRead,
-          description: selectedBook.description || '',
-          notes: selectedBook.notes || ''
-        });
-      }
-    }, [selectedBook]);
-
+    // form e isDraggingCover vivono in App: qui andrebbero persi a ogni
+    // rimontaggio del componente.
     const updateField = (field, value) => setForm(prev => ({ ...prev, [field]: value }));
 
     const esploraCuriosita = async () => {
