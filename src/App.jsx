@@ -10,7 +10,7 @@ import {
 const appId = typeof window !== 'undefined' && window.__app_id ? window.__app_id : 'libri-di-maurizio';
 
 // Incrementare a ogni modifica rilasciata (si parte da 2.0)
-const APP_VERSION = '3.4';
+const APP_VERSION = '3.5';
 
 const STATUSES = {
   ALL: { label: 'Tutti', value: 'ALL' },
@@ -922,7 +922,15 @@ export default function App() {
     // reinserirlo (o reimportarlo dal backup) verrebbe soppresso in silenzio.
     annullaCancellazioni([bookId]);
 
-    // Aggiorna lo stato locale immediatamente
+    // Aggiorna lo stato locale immediatamente.
+    // booksRef va aggiornato qui, in modo sincrono, e non solo nell'effetto
+    // che scatta dopo il ridisegno: due modifiche ravvicinate sullo stesso
+    // libro devono partire entrambe dalla versione piu' fresca.
+    const esisteGia = (booksRef.current || []).some(b => b.id === bookId);
+    booksRef.current = esisteGia
+      ? (booksRef.current || []).map(b => b.id === bookId ? cleanBook : b)
+      : [cleanBook, ...(booksRef.current || [])];
+
     setBooks(prev => {
       const exists = prev.some(b => b.id === bookId);
       if (exists) {
@@ -960,6 +968,21 @@ export default function App() {
     // Conferma solo per i salvataggi espliciti: stelle, stato e flag passano
     // di qui a ogni clic e riempirebbero lo schermo di messaggi.
     if (portaInCima) showToast("Libro salvato nella tua libreria!");
+  };
+
+  // Modifica mirata di alcuni campi di un libro.
+  // Va usata da tutti i comandi rapidi (stelle, stato, flag): applicare la
+  // modifica alla versione tenuta dalla riga significherebbe partire da una
+  // fotografia dell'ultimo ridisegno, e due clic ravvicinati sullo stesso
+  // libro farebbero sì che il secondo riporti indietro il primo.
+  // patch puo' essere un oggetto oppure una funzione che riceve la versione
+  // corrente — indispensabile per gli interruttori, che dipendono dal valore
+  // di partenza.
+  const aggiornaCampi = (bookId, patch) => {
+    const attuale = (booksRef.current || []).find(b => b.id === bookId);
+    if (!attuale) return;
+    const modifiche = typeof patch === 'function' ? patch(attuale) : patch;
+    return saveBookToCloud({ ...attuale, ...modifiche });
   };
 
   // Unico punto di eliminazione, usato da scheda libro, eliminazione multipla
@@ -1201,36 +1224,38 @@ export default function App() {
       if (!bookId) return;
       // Riordino interno già gestito dal drop sulla riga
       if (e.dataTransfer.getData('application/x-sezione') === targetSection) return;
-      const targetBook = books.find(b => b.id === bookId);
+      // Come per i comandi rapidi, la modifica va applicata alla versione
+      // corrente e non a quella fotografata all'ultimo ridisegno.
+      const targetBook = (booksRef.current || []).find(b => b.id === bookId);
       if (!targetBook) return;
-      let updatedBook = { ...targetBook };
+      const modifiche = {};
       if (targetSection === 'inLettura') {
-        updatedBook.status = 'READING';
+        modifiche.status = 'READING';
         showToast(`"${targetBook.title}" spostato In Lettura!`);
       } else if (targetSection === 'preferiti') {
-        updatedBook.rating = 5;
+        modifiche.rating = 5;
         showToast(`"${targetBook.title}" spostato nei Preferiti (5★)!`);
       } else if (targetSection === 'daScaricare') {
-        updatedBook.daScaricare = true;
+        modifiche.daScaricare = true;
         showToast(`"${targetBook.title}" segnato come Da Scaricare!`);
       } else if (targetSection === 'giaLetti') {
-        updatedBook.status = 'READ';
+        modifiche.status = 'READ';
         showToast(`"${targetBook.title}" spostato nei Già Letti!`);
       } else if (targetSection === 'daLeggere') {
         // La sezione mostra solo i libri "In Coda": senza alzare il flag il
         // libro trascinato qui sparirebbe subito dalla vista.
-        updatedBook.status = 'TO_READ';
-        updatedBook.isNextRead = true;
+        modifiche.status = 'TO_READ';
+        modifiche.isNextRead = true;
         showToast(`"${targetBook.title}" messo in coda tra i Da Leggere!`);
       }
-      saveBookToCloud(updatedBook);
+      aggiornaCampi(bookId, modifiche);
     };
 
     // Inline Star Rating
     const InlineStars = ({ book }) => (
       <div className="flex gap-0.5">
         {[1,2,3,4,5].map(s => (
-          <button key={s} onClick={(e) => { e.stopPropagation(); saveBookToCloud({...book, rating: book.rating === s ? 0 : s}); }}
+          <button key={s} onClick={(e) => { e.stopPropagation(); aggiornaCampi(book.id, v => ({ rating: v.rating === s ? 0 : s })); }}
             className="cursor-pointer p-0 border-0 bg-transparent">
             <Star size={12} className={s <= (book.rating || 0) ? 'fill-yellow-400 text-yellow-400' : 'text-slate-300'} />
           </button>
@@ -1242,7 +1267,7 @@ export default function App() {
     const InlineStatus = ({ book }) => (
       <select value={book.status} 
         onClick={(e) => e.stopPropagation()}
-        onChange={(e) => { e.stopPropagation(); saveBookToCloud({...book, status: e.target.value}); }}
+        onChange={(e) => { e.stopPropagation(); aggiornaCampi(book.id, { status: e.target.value }); }}
         className="text-[10px] font-bold bg-slate-100 border border-slate-200 rounded px-1 py-0.5 cursor-pointer outline-none">
         <option value="TO_READ">Da Leggere</option>
         <option value="READING">In Lettura</option>
@@ -1252,7 +1277,7 @@ export default function App() {
 
     // DaScaricare Toggle
     const DaScaricareBadge = ({ book }) => (
-      <button onClick={(e) => { e.stopPropagation(); saveBookToCloud({...book, daScaricare: !book.daScaricare}); }}
+      <button onClick={(e) => { e.stopPropagation(); aggiornaCampi(book.id, v => ({ daScaricare: !v.daScaricare })); }}
         title={book.daScaricare ? "Rimuovi flag Da Scaricare" : "Segna come Da Scaricare"}
         className={`text-[10px] font-bold px-1.5 py-0.5 rounded cursor-pointer transition-colors ${book.daScaricare ? 'bg-emerald-100 text-emerald-700 border border-emerald-300' : 'bg-slate-50 text-slate-400 border border-slate-200 hover:bg-slate-100'}`}>
         📥 {book.daScaricare ? 'Sì' : 'No'}
@@ -1261,7 +1286,7 @@ export default function App() {
 
     // Interruttore "In Coda": determina chi compare nella sezione Da Leggere
     const InCodaBadge = ({ book }) => (
-      <button onClick={(e) => { e.stopPropagation(); saveBookToCloud({...book, isNextRead: !book.isNextRead}); }}
+      <button onClick={(e) => { e.stopPropagation(); aggiornaCampi(book.id, v => ({ isNextRead: !v.isNextRead })); }}
         title={book.isNextRead ? "Togli dalla coda di lettura" : "Metti in coda di lettura"}
         className={`text-[10px] font-bold px-1.5 py-0.5 rounded cursor-pointer transition-colors ${book.isNextRead ? 'bg-purple-100 text-purple-700 border border-purple-300' : 'bg-slate-50 text-slate-400 border border-slate-200 hover:bg-slate-100'}`}>
         🔖 {book.isNextRead ? 'In Coda' : 'Coda'}
