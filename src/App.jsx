@@ -10,7 +10,7 @@ import {
 const appId = typeof window !== 'undefined' && window.__app_id ? window.__app_id : 'libri-di-maurizio';
 
 // Incrementare a ogni modifica rilasciata (si parte da 2.0)
-const APP_VERSION = '3.6';
+const APP_VERSION = '3.7';
 
 const STATUSES = {
   ALL: { label: 'Tutti', value: 'ALL' },
