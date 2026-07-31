@@ -10,7 +10,7 @@ import {
 const appId = typeof window !== 'undefined' && window.__app_id ? window.__app_id : 'libri-di-maurizio';
 
 // Incrementare a ogni modifica rilasciata (si parte da 2.0)
-const APP_VERSION = '3.5';
+const APP_VERSION = '3.6';
 
 const STATUSES = {
   ALL: { label: 'Tutti', value: 'ALL' },
@@ -721,6 +721,16 @@ export default function App() {
               }
             }
           }
+
+          // Chiave Gemini inserita prima che venisse sincronizzata: e' rimasta
+          // solo in questo browser e sul cloud non c'e' nulla da leggere, cosi'
+          // su ogni altro dispositivo viene richiesta di nuovo. Se la troviamo
+          // qui e manca la' , la si carica una volta per tutte senza chiedere.
+          const chiaveLocale = (localStorage.getItem('gemini_api_key') || '').trim();
+          const chiaveCloud = (doc.exists ? (doc.data().geminiApiKey || '') : '').trim();
+          if (chiaveLocale && !chiaveCloud) {
+            saveSettingsToCloud({ geminiApiKey: chiaveLocale });
+          }
         },
         (error) => {
           console.error("Firestore Settings Sync Error:", error);
@@ -1171,14 +1181,19 @@ export default function App() {
       daScaricareOrder
     );
 
-    // Sezione 2: Preferiti - 5 stelle, poi 4 stelle, poi updatedAt; infine ordine manuale
-    const preferitiBooks = applyManualOrder(
-      books.filter(b => (b.rating || 0) >= 4).sort((a, b) => {
-        if ((b.rating || 0) !== (a.rating || 0)) return (b.rating || 0) - (a.rating || 0);
-        return byRecent(a, b);
-      }),
-      preferitiOrder
+    // Sezione 2: Preferiti - prima tutte le 5 stelle, poi tutte le 4.
+    // Il voto viene prima di ogni altra cosa: applicando l'ordine manuale
+    // all'intero elenco, un libro non ancora riordinato salirebbe in cima
+    // scavalcando le 5 stelle. Si formano quindi due gruppi separati, e
+    // l'ordine manuale vale solo dentro ciascuno.
+    const preferiti5 = applyManualOrder(
+      books.filter(b => (b.rating || 0) === 5).sort(byRecent), preferitiOrder
     );
+    const preferiti4 = applyManualOrder(
+      books.filter(b => (b.rating || 0) === 4).sort(byRecent), preferitiOrder
+    );
+    const preferitiGroups = [preferiti5, preferiti4];
+    const preferitiBooks = [...preferiti5, ...preferiti4];
 
     // Sezione 3: Già Letti - per data di ultima modifica, poi ordine manuale
     const giaLettiBooks = applyManualOrder(readBooks.slice().sort(byRecent), giaLettiOrder);
@@ -1447,6 +1462,7 @@ export default function App() {
           <DashSection
             title="⭐ I tuoi Preferiti" icon={Star} iconClass="text-yellow-500 fill-yellow-500"
             badgeClass="bg-yellow-100 text-yellow-800" books={preferitiBooks}
+            groups={preferitiGroups}
             limitKey="preferiti" dropTarget="preferiti"
             emptyMsg="Nessun libro preferito. Assegna 4 o 5 stelle a un libro!"
           />
