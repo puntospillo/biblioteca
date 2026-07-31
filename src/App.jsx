@@ -9,8 +9,22 @@ import {
 
 const appId = typeof window !== 'undefined' && window.__app_id ? window.__app_id : 'libri-di-maurizio';
 
+// Istruzione condivisa da tutte le richieste all'assistente: risposta in
+// italiano e impaginata, perche' senza indicazioni esplicite il modello
+// alterna l'inglese e produce muri di testo.
+const PROMPT_EDITORE = `Sei il curatore editoriale di una libreria italiana.
+Rispondi SEMPRE ed ESCLUSIVAMENTE in italiano, anche se il titolo o l'autore sono stranieri.
+Scrivi in prosa curata e scorrevole, con il tono di una quarta di copertina: mai burocratico, mai promozionale.
+Impagina il testo in Markdown perché sia leggibile:
+- "## " per i titoli di sezione;
+- "**grassetto**" per titoli di libri e nomi propri alla prima citazione;
+- "- " per gli elenchi puntati;
+- una riga vuota fra i paragrafi, che devono restare brevi (3-5 righe).
+Non usare tabelle, non usare emoji, non aprire con formule come "Certo!" o "Ecco".
+Entra subito nel merito.`;
+
 // Incrementare a ogni modifica rilasciata (si parte da 2.0)
-const APP_VERSION = '3.7';
+const APP_VERSION = '3.9';
 
 const STATUSES = {
   ALL: { label: 'Tutti', value: 'ALL' },
@@ -297,6 +311,55 @@ const fetchNovitaItalia = async (quanti = 30) => {
       }
     };
   });
+};
+
+// Scheda del libro da fonti editoriali reali, senza AI.
+// Va tentata per prima: le trame dei negozi sono quelle di quarta di
+// copertina, gia' in italiano e verificate, mentre un modello linguistico su
+// un titolo poco noto tende a inventare. L'AI resta come ultima risorsa.
+const cercaSchedaLibro = async (title, author = '') => {
+  const risultato = { descrizione: '', copertina: '', fonte: '' };
+  if (!title) return risultato;
+  const query = encodeURIComponent(`${title} ${author}`.trim());
+
+  // 1. Apple Books Italia: trama e copertina in una sola richiesta
+  try {
+    const res = await fetch(`https://itunes.apple.com/search?term=${query}&entity=ebook&country=it&limit=1`);
+    if (res.ok) {
+      const d = await res.json();
+      const b = (d.results || [])[0];
+      if (b) {
+        if (b.description) {
+          risultato.descrizione = pulisciHtml(b.description);
+          risultato.fonte = 'Apple Books';
+        }
+        if (b.artworkUrl100) risultato.copertina = b.artworkUrl100.replace('100x100bb', '600x600bb');
+      }
+    }
+  } catch (e) { console.warn('Apple Books non raggiungibile:', e); }
+
+  // 2. Google Books, per i titoli che Apple non ha
+  if (!risultato.descrizione || !risultato.copertina) {
+    try {
+      const res = await fetch(`https://www.googleapis.com/books/v1/volumes?q=${query}&maxResults=3&langRestrict=it`);
+      if (res.ok) {
+        const d = await res.json();
+        for (const item of (d.items || [])) {
+          const v = item.volumeInfo || {};
+          if (!risultato.descrizione && v.description) {
+            risultato.descrizione = pulisciHtml(v.description);
+            risultato.fonte = risultato.fonte || 'Google Books';
+          }
+          if (!risultato.copertina && v.imageLinks?.thumbnail) {
+            risultato.copertina = v.imageLinks.thumbnail.replace('http:', 'https:').replace('&edge=curl', '');
+          }
+          if (risultato.descrizione && risultato.copertina) break;
+        }
+      }
+    } catch (e) { console.warn('Google Books non raggiungibile:', e); }
+  }
+
+  return risultato;
 };
 
 const secureCoverFetch = async (title, author = '') => {
@@ -1396,10 +1459,26 @@ export default function App() {
     // AI Handlers
     const handleConsiglioBibliotecario = async () => {
       setAiModal({ isOpen: true, title: 'Il Consiglio del Bibliotecario AI', content: '', loading: true });
-      const lettiTitoli = readBooks.map(b => `${b.title} (${b.lastName})`).slice(0, 10).join(', ');
-      const prompt = `Ho letto e apprezzato questi libri: ${lettiTitoli || 'romanzi classici e moderni'}. Basandoti sui miei gusti, consigliami 3 libri con autore e motivazione in italiano.`;
+      // Si passano i piu' votati, non i primi qualsiasi: sono quelli che
+      // descrivono davvero i gusti del lettore.
+      const preferiti = readBooks.slice()
+        .sort((a, b) => (b.rating || 0) - (a.rating || 0))
+        .slice(0, 12)
+        .map(b => `${b.title} di ${b.lastName}${b.rating ? ` (${b.rating}/5)` : ''}`)
+        .join('; ');
+      const prompt = `Ecco i libri che ho letto e come li ho votati: ${preferiti || 'romanzi classici e moderni'}.
+
+Consigliami tre libri che non sono in questo elenco.
+Per ciascuno usa questa struttura:
+
+## Titolo del libro
+**Autore** — anno di pubblicazione
+Due o tre righe sul libro.
+Una riga che spieghi perché si adatta ai miei gusti, richiamando un titolo preciso fra quelli che ho letto.
+
+Chiudi con una breve sezione "## In sintesi" di due righe.`;
       try {
-        const risposta = await handleAiCallWithCheck(prompt, "Sei un bibliotecario colto e appassionato.", true); 
+        const risposta = await handleAiCallWithCheck(prompt, PROMPT_EDITORE, true);
         setAiModal({ isOpen: true, title: 'Il Consiglio del Bibliotecario AI', content: risposta, loading: false });
       } catch (e) {
         setAiModal({ isOpen: true, title: 'Assistente AI', content: e.message || 'Impossibile contattare l\'assistente AI.', loading: false });
@@ -1408,10 +1487,34 @@ export default function App() {
 
     const handleProfiloLettore = async () => {
       setAiModal({ isOpen: true, title: 'Identikit del Lettore AI', content: '', loading: true });
-      const lettiTitoli = readBooks.map(b => `${b.title} (${b.lastName})`).join(', ');
-      const prompt = `Analizza questa lista di letture dell'utente: ${lettiTitoli || 'Nessun libro inserito ancora.'}. Crea un profilo psicologico e letterario simpatico ed accurato. Assegnagli un archetipo di lettore in italiano (es. "L'Esploratore di Mondi", "L'Analista Notturno").`;
+      // Con migliaia di libri l'elenco integrale supererebbe i limiti della
+      // richiesta: si inviano i piu' votati e qualche dato d'insieme.
+      const campione = readBooks.slice()
+        .sort((a, b) => (b.rating || 0) - (a.rating || 0))
+        .slice(0, 60)
+        .map(b => `${b.title} di ${b.lastName}${b.rating ? ` (${b.rating}/5)` : ''}`)
+        .join('; ');
+      const inLettura = books.filter(b => b.status === 'READING').map(b => b.title).slice(0, 5).join('; ');
+      const prompt = `Questi sono i miei libri più apprezzati fra i ${readBooks.length} che ho letto: ${campione || 'nessun libro ancora'}.
+${inLettura ? `In questo momento sto leggendo: ${inLettura}.` : ''}
+
+Scrivi il mio identikit di lettore con questa struttura:
+
+## L'archetipo
+Un nome evocativo fra virgolette e due righe che lo spieghino.
+
+## Cosa cerchi in un libro
+Tre punti elenco, ciascuno con un esempio preso dalle mie letture.
+
+## Le tue ossessioni
+Temi o autori ricorrenti che emergono dall'elenco.
+
+## Il tuo punto cieco
+Un genere o un tipo di lettura che ti manca, con un consiglio per colmarlo.
+
+Tono acuto e affettuoso, mai adulatorio. Basati solo su ciò che vedi nell'elenco.`;
       try {
-        const risposta = await handleAiCallWithCheck(prompt, "Sei un critico letterario ironico ed empatico.", false);
+        const risposta = await handleAiCallWithCheck(prompt, PROMPT_EDITORE, false);
         setAiModal({ isOpen: true, title: 'Il Tuo Identikit Letterario AI', content: risposta, loading: false });
       } catch (e) {
         setAiModal({ isOpen: true, title: 'Assistente AI', content: e.message || 'Impossibile generare l\'identikit.', loading: false });
@@ -1603,10 +1706,22 @@ export default function App() {
         // testi scritti a mano.
         if (b.description) { saltati++; continue; }
         try {
-          const prompt = `Riassumi in massimo 50 parole la trama del libro "${b.title}" di ${b.lastName}. In italiano.`;
-          const trama = await handleAiCallWithCheck(prompt, "", true);
+          // Prima le fonti editoriali: sono in italiano, verificate e non
+          // consumano la quota della chiave AI.
+          const scheda = await cercaSchedaLibro(b.title, b.lastName || b.firstName);
+          let trama = scheda.descrizione;
+          if (!trama) {
+            trama = await handleAiCallWithCheck(
+              `Riassumi in massimo 80 parole la trama del libro "${b.title}" di ${b.lastName}.`,
+              PROMPT_EDITORE + "\nRispondi con un unico paragrafo, senza titoli né elenchi.",
+              true
+            );
+          }
           if (trama) {
-            await saveBookToCloud({ ...b, description: trama });
+            // La copertina, se manca, arriva dalla stessa ricerca
+            const aggiornato = { ...b, description: trama };
+            if (!b.coverUrl && scheda.copertina) aggiornato.coverUrl = scheda.copertina;
+            await saveBookToCloud(aggiornato);
             count++;
           }
         } catch (e) {
@@ -2211,21 +2326,41 @@ export default function App() {
       if(!form.title) return showToast("Inserisci un titolo.", "info");
       setAiModal({ isOpen: true, title: 'Ricerca Info Web AI', content: 'Ricerca trama e copertina sul web...', loading: true });
       try {
-        const info = await handleAiCallWithCheck(`Cerca sul web la trama del libro "${form.title}" di ${form.lastName || form.firstName}. Riassumi in 3 paragrafi. In italiano.`, "", true);
+        const autore = form.lastName || form.firstName;
 
-        // La copertina va cercata sempre: il pulsante si chiama "Cerca
-        // Trama/Cover", quindi saltarla quando ne esiste gia' una faceva
-        // sembrare la ricerca rotta. Se non si trova nulla si tiene quella
-        // attuale invece di cancellarla.
-        const coverTrovata = await secureCoverFetch(form.title, form.lastName || form.firstName);
-        const newCoverUrl = coverTrovata || form.coverUrl;
+        // Prima le fonti editoriali vere: danno la trama di quarta di
+        // copertina, gia' in italiano, e la copertina nella stessa richiesta.
+        const scheda = await cercaSchedaLibro(form.title, autore);
 
-        setForm(prev => ({ ...prev, description: info, coverUrl: newCoverUrl }));
+        let descrizione = scheda.descrizione;
+        let fonte = scheda.fonte;
+
+        // L'AI interviene solo se le fonti reali non hanno la trama
+        if (!descrizione) {
+          descrizione = await handleAiCallWithCheck(
+            `Scrivi la trama del libro "${form.title}" di ${autore}.`,
+            PROMPT_EDITORE + "\nScrivi 2-3 paragrafi discorsivi, senza titoli né elenchi. " +
+            "Se non conosci il libro con certezza, dillo apertamente in una riga invece di inventare.",
+            true
+          );
+          fonte = 'assistente AI';
+        }
+
+        // La copertina va cercata sempre: saltarla quando ne esiste gia' una
+        // faceva sembrare la ricerca rotta.
+        const copertina = scheda.copertina || await secureCoverFetch(form.title, autore);
+        const newCoverUrl = copertina || form.coverUrl;
+
+        setForm(prev => ({ ...prev, description: descrizione || prev.description, coverUrl: newCoverUrl }));
         setAiModal({ isOpen: false, title:'', content:'', loading: false });
+
         // Messaggio veritiero: prima diceva "recuperate" anche senza copertina
+        const parti = [];
+        parti.push(descrizione ? `trama da ${fonte}` : 'trama non trovata');
+        parti.push(copertina ? 'copertina trovata' : 'nessuna copertina');
         showToast(
-          coverTrovata ? "Trama e copertina recuperate!" : "Trama recuperata. Nessuna copertina trovata sul web.",
-          coverTrovata ? "success" : "info"
+          parti.join(', ').replace(/^./, c => c.toUpperCase()) + '.',
+          descrizione && copertina ? "success" : "info"
         );
       } catch(e) { 
         setAiModal({ isOpen: false, title:'', content:'', loading: false }); 
@@ -2672,6 +2807,61 @@ export default function App() {
   };
 
   // 8. Reusable AI Response Modal
+  // Impagina la risposta dell'assistente.
+  // Il modello risponde in Markdown: mostrato grezzo, l'utente vedeva gli
+  // asterischi e i cancelletti in mezzo al testo. Qui non serve una libreria
+  // completa, bastano i pochi elementi che chiediamo nel prompt.
+  const TestoImpaginato = ({ testo }) => {
+    const grassetto = (riga, chiave) => {
+      const pezzi = String(riga).split(/(\*\*[^*]+\*\*|\*[^*]+\*)/g).filter(Boolean);
+      return pezzi.map((p, i) => {
+        if (p.startsWith('**') && p.endsWith('**')) {
+          return <strong key={`${chiave}-${i}`} className="font-bold text-slate-900">{p.slice(2, -2)}</strong>;
+        }
+        if (p.startsWith('*') && p.endsWith('*') && p.length > 2) {
+          return <em key={`${chiave}-${i}`} className="italic">{p.slice(1, -1)}</em>;
+        }
+        return <span key={`${chiave}-${i}`}>{p}</span>;
+      });
+    };
+
+    const blocchi = [];
+    let elenco = [];
+    const chiudiElenco = () => {
+      if (elenco.length === 0) return;
+      blocchi.push(
+        <ul key={`ul-${blocchi.length}`} className="list-disc pl-5 space-y-1.5 my-3 marker:text-indigo-400">
+          {elenco.map((v, i) => <li key={i} className="leading-relaxed">{grassetto(v, `li${i}`)}</li>)}
+        </ul>
+      );
+      elenco = [];
+    };
+
+    String(testo || '').split('\n').forEach((riga, i) => {
+      const r = riga.trim();
+      if (!r) { chiudiElenco(); return; }
+      if (/^#{1,6}\s/.test(r)) {
+        chiudiElenco();
+        const livello = r.match(/^#+/)[0].length;
+        const contenuto = r.replace(/^#+\s*/, '');
+        blocchi.push(
+          <h4 key={i} className={`font-extrabold text-slate-900 tracking-tight ${livello <= 2 ? 'text-base mt-5 mb-2' : 'text-sm mt-4 mb-1.5'} first:mt-0`}>
+            {grassetto(contenuto, `h${i}`)}
+          </h4>
+        );
+        return;
+      }
+      if (/^[-*•]\s+/.test(r)) { elenco.push(r.replace(/^[-*•]\s+/, '')); return; }
+      if (/^\d+[.)]\s+/.test(r)) { elenco.push(r.replace(/^\d+[.)]\s*/, '')); return; }
+      if (/^(---|___|\*\*\*)$/.test(r)) { chiudiElenco(); blocchi.push(<hr key={i} className="my-4 border-slate-200" />); return; }
+      chiudiElenco();
+      blocchi.push(<p key={i} className="leading-relaxed my-2.5">{grassetto(r, `p${i}`)}</p>);
+    });
+    chiudiElenco();
+
+    return <div className="text-[13px] text-slate-700">{blocchi}</div>;
+  };
+
   const AiModalView = () => {
     const [copied, setCopied] = useState(false);
 
@@ -2702,8 +2892,8 @@ export default function App() {
             </div>
           ) : (
             <>
-              <div className="flex-1 overflow-y-auto text-xs text-slate-700 leading-relaxed whitespace-pre-wrap font-sans bg-slate-50 p-4 rounded-xl border border-slate-200">
-                {aiModal.content}
+              <div className="flex-1 overflow-y-auto bg-white px-5 py-4 rounded-xl border border-slate-200">
+                <TestoImpaginato testo={aiModal.content} />
               </div>
               <div className="flex justify-between items-center pt-2">
                 <button onClick={copyToClipboard} className="text-xs font-bold text-slate-600 hover:text-indigo-600 flex items-center gap-1 cursor-pointer">
